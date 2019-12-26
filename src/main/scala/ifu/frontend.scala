@@ -2,8 +2,6 @@
 // Copyright (c) 2017 - 2019, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -26,12 +24,11 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property._
-import freechips.rocketchip.diplomaticobjectmodel.logicaltree.{ICacheLogicalTreeNode}
 
 import boom.bpu._
 import boom.common._
 import boom.exu.{BranchUnitResp, CommitExceptionSignals}
-import boom.lsu.{CanHaveBoomPTW, CanHaveBoomPTWModule}
+import boom.util.{BoomCoreStringPrefix}
 
 /**
  * Parameters to manage a L1 Banked ICache
@@ -116,6 +113,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val status_prv        = Output(UInt(freechips.rocketchip.rocket.PRV.SZ.W))
   val status_debug      = Output(Bool())
 
+  // Breakpoint info
+  val status            = Output(new MStatus)
+  val bp                = Output(Vec(nBreakpoints, new BP))
+
   val perf              = Input(new FrontendPerfEvents())
   val tsc_reg           = Output(UInt(xLen.W))
 }
@@ -165,7 +166,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val icache = outer.icache.module
   val tlb = Module(new TLB(true, log2Ceil(fetchBytes), TLBConfig(nTLBEntries)))
   val fetch_controller = Module(new FetchControlUnit)
-  val bpdpipeline = Module(new BranchPredictionStage)
+  val bpdpipeline = Module(new BranchPredictionStage(bankBytes))
 
   val s0_pc = Wire(UInt(vaddrBitsExtended.W))
   val s0_valid = fetch_controller.io.imem_req.valid || fetch_controller.io.imem_resp.ready
@@ -254,6 +255,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   fetch_controller.io.br_unit           := io.cpu.br_unit
   fetch_controller.io.tsc_reg           := io.cpu.tsc_reg
 
+  fetch_controller.io.status            := io.cpu.status
+  fetch_controller.io.bp                := io.cpu.bp
+
   fetch_controller.io.f2_btb_resp       := bpdpipeline.io.f2_btb_resp
   fetch_controller.io.f3_bpd_resp       := bpdpipeline.io.f3_bpd_resp
   fetch_controller.io.f2_bpd_resp       := DontCare
@@ -297,10 +301,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   bpdpipeline.io.f2_valid := fetch_controller.io.imem_resp.valid
   bpdpipeline.io.f2_redirect := fetch_controller.io.f2_redirect
+  bpdpipeline.io.f3_will_redirect := fetch_controller.io.f3_will_redirect
   bpdpipeline.io.f4_redirect := fetch_controller.io.f4_redirect
   bpdpipeline.io.f4_taken := fetch_controller.io.f4_taken
   bpdpipeline.io.fe_clear := fetch_controller.io.clear_fetchbuffer
 
+  bpdpipeline.io.f2_aligned_pc := alignToFetchBoundary(s2_pc)
   bpdpipeline.io.f3_ras_update := fetch_controller.io.f3_ras_update
   bpdpipeline.io.f3_btb_update := fetch_controller.io.f3_btb_update
   bpdpipeline.io.bim_update    := fetch_controller.io.bim_update
@@ -320,32 +326,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   def ccover(cond: Bool, label: String, desc: String)(implicit sourceInfo: SourceInfo) =
     cover(cond, s"FRONTEND_$label", "Rocket;;" + desc)
 
-  override def toString: String = bpdpipeline.toString + "\n" + icache.toString
+  override def toString: String =
+    (BoomCoreStringPrefix("====Overall Frontend Params====") + "\n"
+    + bpdpipeline.toString + "\n"
+    + icache.toString)
 }
 
-/**
- * Mix-in for constructing tiles that have an ICache-based pipeline frontend
- */
-trait HasBoomICacheFrontend extends CanHaveBoomPTW
-{
-  this: BaseTile =>
-  val module: HasBoomICacheFrontendModule
-  val frontend = LazyModule(new BoomFrontend(tileParams.icache.get, hartId))
-  tlMasterXbar.node := frontend.masterNode
-  connectTLSlave(frontend.slaveNode, tileParams.core.fetchBytes)
-  nPTWPorts += 1
-  nPTWPorts += 1 // boom -- needs an extra PTW port for its LSU.
-
-  val iCacheLogicalTreeNode = new ICacheLogicalTreeNode(frontend.icache.device, tileParams.icache.get)
-
-}
-
-/**
- * Mix-in for constructing tiles that have an ICache-based pipeline frontend
- */
-trait HasBoomICacheFrontendModule extends CanHaveBoomPTWModule
-{
-  val outer: HasBoomICacheFrontend
-  ptwPorts += outer.frontend.module.io.ptw
-}
 

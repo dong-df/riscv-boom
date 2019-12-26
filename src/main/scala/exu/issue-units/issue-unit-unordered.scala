@@ -2,8 +2,6 @@
 // Copyright (c) 2015 - 2018, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -42,7 +40,7 @@ class IssueUnitStatic(
     issue_slots(i).in_uop.valid := entry_wen_oh(i).orR
     issue_slots(i).in_uop.bits  := Mux1H(entry_wen_oh(i), dis_uops)
     issue_slots(i).wakeup_ports := io.wakeup_ports
-    issue_slots(i).ldspec_dst   := io.mem_ldSpecWakeup
+    issue_slots(i).ldspec_dst   := io.spec_ld_wakeup
     issue_slots(i).brinfo       := io.brinfo
     issue_slots(i).kill         := io.flush_pipeline
     issue_slots(i).clear        := false.B
@@ -96,9 +94,9 @@ class IssueUnitStatic(
     io.iss_valids(w) := false.B
     io.iss_uops(w)   := NullMicroOp
     // unsure if this is overkill
-    io.iss_uops(w).pop1 := 0.U
-    io.iss_uops(w).pop2 := 0.U
-    io.iss_uops(w).pop3 := 0.U
+    io.iss_uops(w).prs1 := 0.U
+    io.iss_uops(w).prs2 := 0.U
+    io.iss_uops(w).prs3 := 0.U
     io.iss_uops(w).lrs1_rtype := RT_X
     io.iss_uops(w).lrs2_rtype := RT_X
   }

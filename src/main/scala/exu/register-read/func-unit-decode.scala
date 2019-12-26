@@ -2,8 +2,6 @@
 // Copyright (c) 2015 - 2018, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -310,6 +308,7 @@ object FDivRRdDecode extends RRdDecodeConstants
  * @param supportedUnits indicate what functional units are being used
  */
 class RegisterReadDecode(supportedUnits: SupportedFuncUnits)(implicit p: Parameters) extends BoomModule
+  with freechips.rocketchip.rocket.constants.MemoryOpConstants
 {
   val io = IO(new BoomBundle {
     val iss_valid = Input(Bool())
@@ -335,7 +334,6 @@ class RegisterReadDecode(supportedUnits: SupportedFuncUnits)(implicit p: Paramet
 
   // rrd_use_alupipe is unused
   io.rrd_uop.ctrl.br_type := rrd_cs.br_type
-  io.rrd_uop.ctrl.rf_wen  := rrd_cs.rf_wen
   io.rrd_uop.ctrl.op1_sel := rrd_cs.op1_sel
   io.rrd_uop.ctrl.op2_sel := rrd_cs.op2_sel
   io.rrd_uop.ctrl.imm_sel := rrd_cs.imm_sel
@@ -345,11 +343,11 @@ class RegisterReadDecode(supportedUnits: SupportedFuncUnits)(implicit p: Paramet
   io.rrd_uop.ctrl.is_sta  := io.rrd_uop.uopc === uopSTA || io.rrd_uop.uopc === uopAMO_AG
   io.rrd_uop.ctrl.is_std  := io.rrd_uop.uopc === uopSTD || (io.rrd_uop.ctrl.is_sta && io.rrd_uop.lrs2_rtype === RT_FIX)
 
-  when (io.rrd_uop.uopc === uopAMO_AG) {
+  when (io.rrd_uop.uopc === uopAMO_AG || (io.rrd_uop.uopc === uopLD && io.rrd_uop.mem_cmd === M_XLR)) {
     io.rrd_uop.imm_packed := 0.U
   }
 
-  val raddr1 = io.rrd_uop.pop1 // although renamed, it'll stay 0 if lrs1 = 0
+  val raddr1 = io.rrd_uop.prs1 // although renamed, it'll stay 0 if lrs1 = 0
   val csr_ren = (rrd_cs.csr_cmd === CSR.S || rrd_cs.csr_cmd === CSR.C) && raddr1 === 0.U
   io.rrd_uop.ctrl.csr_cmd := Mux(csr_ren, CSR.R, rrd_cs.csr_cmd)
 

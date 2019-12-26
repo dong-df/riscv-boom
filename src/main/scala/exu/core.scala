@@ -1,8 +1,6 @@
 //******************************************************************************
-// Copyright (c) 2015 - 2018, The Regents of the University of California (Regents).
+// Copyright (c) 2015 - 2019, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
-//------------------------------------------------------------------------------
-// Author: Christopher Celio
 //------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
@@ -30,19 +28,21 @@
 
 package boom.exu
 
+import java.nio.file.{Paths}
+
 import chisel3._
 import chisel3.util._
-import chisel3.experimental.dontTouch
 
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket.{Causes, PRV}
 import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle}
+import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
 
 import boom.common._
 import boom.exu.FUConstants._
-import boom.system.BoomTilesKey
-import boom.util.{RobTypeToChars, BoolToChar, GetNewUopAndBrMask, Sext, WrapInc}
+import boom.common.BoomTilesKey
+import boom.util.{RobTypeToChars, BoolToChar, GetNewUopAndBrMask, Sext, WrapInc, BoomCoreStringPrefix, DromajoCosimBlackBox}
 
 /**
  * IO bundle for the BOOM Core. Connects the external components such as
@@ -56,13 +56,12 @@ trait HasBoomCoreIO extends freechips.rocketchip.tile.HasTileParameters
   {
     val interrupts = Input(new freechips.rocketchip.tile.CoreInterrupts())
     val ifu = new boom.ifu.BoomFrontendIO
-    val dmem = new freechips.rocketchip.rocket.HellaCacheIO
     val ptw = Flipped(new freechips.rocketchip.rocket.DatapathPTWIO())
     val rocc = Flipped(new freechips.rocketchip.tile.RoCCCoreIO())
+    val lsu = Flipped(new boom.lsu.LSUCoreIO)
     val ptw_tlb = new freechips.rocketchip.rocket.TLBPTWIO()
     val trace = Output(Vec(coreParams.retireWidth,
       new freechips.rocketchip.rocket.TracedInstruction))
-    val release = Flipped(Valid(new boom.lsu.ReleaseInfo))
     val fcsr_rm = UInt(freechips.rocketchip.tile.FPConstants.RM_SZ.W)
   }
 }
@@ -70,7 +69,7 @@ trait HasBoomCoreIO extends freechips.rocketchip.tile.HasTileParameters
 /**
  * Top level core object that connects the Frontend to the rest of the pipeline.
  */
-class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdgeOut) extends BoomModule
+class BoomCore(implicit p: Parameters) extends BoomModule
    with HasBoomCoreIO
 {
   //**********************************
@@ -86,43 +85,46 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   // ********************************************************
   // Clear fp_pipeline before use
   if (usingFPU) {
-    fp_pipeline.io.ll_wport  := DontCare
+    fp_pipeline.io.ll_wports := DontCare
     fp_pipeline.io.wb_valids := DontCare
     fp_pipeline.io.wb_pdsts  := DontCare
   }
 
-  val numIrfWritePorts        = exe_units.numIrfWritePorts
+  val numIrfWritePorts        = exe_units.numIrfWritePorts + memWidth
   val numLlIrfWritePorts      = exe_units.numLlIrfWritePorts
   val numIrfReadPorts         = exe_units.numIrfReadPorts
 
   val numFastWakeupPorts      = exe_units.count(_.bypassable)
   val numAlwaysBypassable     = exe_units.count(_.alwaysBypassable)
 
-  val numIntIssueWakeupPorts  = numIrfWritePorts + 1 + numFastWakeupPorts - numAlwaysBypassable // + 1 for ll_wb
-  val numIntRenameWakeupPorts = if (enableFastWakeupsToRename) numIntIssueWakeupPorts else numIrfWritePorts + 1
+  val numIntIssueWakeupPorts  = numIrfWritePorts + numFastWakeupPorts - numAlwaysBypassable // + memWidth for ll_wb
+  val numIntRenameWakeupPorts = numIntIssueWakeupPorts
   val numFpWakeupPorts        = if (usingFPU) fp_pipeline.io.wakeups.length else 0
 
   val decode_units     = for (w <- 0 until decodeWidth) yield { val d = Module(new DecodeUnit); d }
   val dec_brmask_logic = Module(new BranchMaskGenerationLogic(coreWidth))
-  val rename_stage     = Module(new RenameStage(coreWidth, numIntRenameWakeupPorts, numFpWakeupPorts))
-  val issue_units      = new boom.exu.IssueUnits(numIntIssueWakeupPorts)
+  val rename_stage     = Module(new RenameStage(coreWidth, numIntPhysRegs, numIntRenameWakeupPorts, false))
+  val fp_rename_stage  = if (usingFPU) Module(new RenameStage(coreWidth, numFpPhysRegs, numFpWakeupPorts, true))
+                         else null
+  val rename_stages    = if (usingFPU) Seq(rename_stage, fp_rename_stage) else Seq(rename_stage)
+
+  val mem_iss_unit     = Module(new IssueUnitCollapsing(memIssueParam, numIntIssueWakeupPorts))
+  mem_iss_unit.suggestName("mem_issue_unit")
+  val int_iss_unit     = Module(new IssueUnitCollapsing(intIssueParam, numIntIssueWakeupPorts))
+  int_iss_unit.suggestName("int_issue_unit")
+
+  val issue_units      = Seq(mem_iss_unit, int_iss_unit)
   val dispatcher       = Module(new BasicDispatcher)
 
-  val iregfile         = if (enableCustomRf) {
-                           Module(new RegisterFileSeqCustomArray(
+  val iregfile         = Module(new RegisterFileSynthesizable(
                              numIntPhysRegs,
                              numIrfReadPorts,
-                             numIrfWritePorts + 1, // + 1 for ll writebacks
+                             numIrfWritePorts,
                              xLen,
-                             Seq(true) ++ exe_units.bypassable_write_port_mask)) // 0th is bypassable ll_wb
-                         } else {
-                           Module(new RegisterFileSynthesizable(
-                             numIntPhysRegs,
-                             numIrfReadPorts,
-                             numIrfWritePorts + 1, // + 1 for ll writebacks
-                             xLen,
-                             Seq(true) ++ exe_units.bypassable_write_port_mask)) // 0th is bypassable ll_wb
-                         }
+                             Seq.fill(memWidth) {true} ++ exe_units.bypassable_write_port_mask)) // bypassable ll_wb
+
+  // wb arbiter for the 0th ll writeback
+  // TODO: should this be a multi-arb?
   val ll_wbarb         = Module(new Arbiter(new ExeUnitResp(xLen), 1 +
                                                                    (if (usingFPU) 1 else 0) +
                                                                    (if (usingRoCC) 1 else 0)))
@@ -133,10 +135,8 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
                            exe_units.withFilter(_.readsIrf).map(x => 2),
                            exe_units.numTotalBypassPorts,
                            xLen))
-  val dc_shim          = Module(new boom.lsu.DCacheShim())
-  val lsu              = Module(new boom.lsu.LoadStoreUnit(coreWidth))
   val rob              = Module(new Rob(
-                           numIrfWritePorts + 1 + numFpWakeupPorts, // +1 for ll writebacks
+                           numIrfWritePorts + numFpWakeupPorts, // +memWidth for ll writebacks
                            numFpWakeupPorts))
   // Used to wakeup registers in rename and issue. ROB needs to listen to something else.
   val int_iss_wakeups  = Wire(Vec(numIntIssueWakeupPorts, Valid(new ExeUnitResp(xLen))))
@@ -149,22 +149,36 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   //***********************************
   // Pipeline State Registers and Wires
 
-  // Instruction Decode Stage
-  val dec_valids    = Wire(Vec(coreWidth, Bool()))  // are the decoded instruction valid? It may be held up though.
-  val dec_uops      = Wire(Vec(coreWidth, new MicroOp()))
-  val dec_will_fire = Wire(Vec(coreWidth, Bool()))  // can the instruction fire beyond decode?
+  // Decode/Rename1 Stage
+  val dec_valids = Wire(Vec(coreWidth, Bool()))  // are the decoded instruction valid? It may be held up though.
+  val dec_uops   = Wire(Vec(coreWidth, new MicroOp()))
+  val dec_fire   = Wire(Vec(coreWidth, Bool()))  // can the instruction fire beyond decode?
                                                     // (can still be stopped in ren or dis)
-  val dec_rdy       = Wire(Bool())
+  val dec_ready  = Wire(Bool())
+  val dec_xcpts  = Wire(Vec(coreWidth, Bool()))
+  val ren_stalls = Wire(Vec(coreWidth, Bool()))
+
+  // Rename2/Dispatch stage
+  val dis_valids = Wire(Vec(coreWidth, Bool()))
+  val dis_uops   = Wire(Vec(coreWidth, new MicroOp))
+  val dis_fire   = Wire(Vec(coreWidth, Bool()))
+  val dis_ready  = Wire(Bool())
 
   // Issue Stage/Register Read
-  val iss_valids    = Wire(Vec(exe_units.numIrfReaders, Bool()))
-  val iss_uops      = Wire(Vec(exe_units.numIrfReaders, new MicroOp()))
-  val bypasses      = Wire(new BypassData(exe_units.numTotalBypassPorts, xLen))
+  val iss_valids = Wire(Vec(exe_units.numIrfReaders, Bool()))
+  val iss_uops   = Wire(Vec(exe_units.numIrfReaders, new MicroOp()))
+  val bypasses   = Wire(new BypassData(exe_units.numTotalBypassPorts, xLen))
 
   // Branch Unit
   val br_unit = Wire(new BranchUnitResp())
   val brunit_idx = exe_units.br_unit_idx
   br_unit <> exe_units.br_unit_io
+
+  val flush_ifu = br_unit.brinfo.mispredict || // In practice, means flushing everything prior to dispatch.
+                         rob.io.flush.valid || // i.e. 'flush in-order part of the pipeline'
+                         io.ifu.sfence_take_pc
+
+  assert (!(br_unit.brinfo.mispredict && rob.io.commit.rollback), "Can't have a mispredict during rollback.")
 
   for (eu <- exe_units) {
     eu.io.brinfo := br_unit.brinfo
@@ -174,15 +188,12 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
     fp_pipeline.io.brinfo := br_unit.brinfo
   }
 
-  // Shim to DCache
-  io.dmem <> dc_shim.io.dmem
-  dc_shim.io.core <> exe_units.memory_unit.io.dmem
-
   // Load/Store Unit & ExeUnits
-  exe_units.memory_unit.io.lsu_io <> lsu.io
-
-  // TODO: Generate this in lsu
-  val sxt_ldMiss = Wire(Bool())
+  val mem_units = exe_units.memory_units
+  val mem_resps = mem_units.map(_.io.ll_iresp)
+  for (i <- 0 until memWidth) {
+    mem_units(i).io.lsu_io <> io.lsu.exe(i)
+  }
 
   //-------------------------------------------------------------
   // Uarch Hardware Performance Events (HPEs)
@@ -194,30 +205,6 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
       ("nop",       () => false.B),
       ("nop",       () => false.B))),
 
-      // Unused RocketCore HPE's
-      //("load",   () => id_ctrl.mem && id_ctrl.mem_cmd === M_XRD && !id_ctrl.fp),
-      //("store",  () => id_ctrl.mem && id_ctrl.mem_cmd === M_XWR && !id_ctrl.fp),
-      //("amo",    () => Bool(usingAtomics) && id_ctrl.mem && (isAMO(id_ctrl.mem_cmd) ||
-      //                 id_ctrl.mem_cmd.isOneOf(M_XLR, M_XSC))),
-      //("system", () => =/= CSR.N))),
-      //("arith",  () => id_ctrl.wxd && !(id_ctrl.jal || id_ctrl.jalr || id_ctrl.mem || id_ctrl.fp ||
-      //                id_ctrl.div || id_ctrl.csr =/= CSR.N)),
-      //("branch", () => id_ctrl.branch),
-      //("jal",    () => id_ctrl.jal),
-      //("jalr",   () => id_ctrl.jalr))
-      //++ (if (!usingMulDiv) Seq() else Seq(
-      //  ("mul", () => id_ctrl.div && (id_ctrl.alu_fn & ALU.FN_DIV) =/= ALU.FN_DIV),
-      //  ("div", () => id_ctrl.div && (id_ctrl.alu_fn & ALU.FN_DIV) === ALU.FN_DIV)))
-      //++ (if (!usingFPU) Seq() else Seq(
-      //  ("fp load",     () => id_ctrl.fp && io.fpu.dec.ldst && io.fpu.dec.wen),
-      //  ("fp store",    () => id_ctrl.fp && io.fpu.dec.ldst && !io.fpu.dec.wen),
-      //  ("fp add",      () => id_ctrl.fp && io.fpu.dec.fma && io.fpu.dec.swap23),
-      //  ("fp mul",      () => id_ctrl.fp && io.fpu.dec.fma && !io.fpu.dec.swap23 && !io.fpu.dec.ren3),
-      //  ("fp mul-add",  () => id_ctrl.fp && io.fpu.dec.fma && io.fpu.dec.ren3),
-      //  ("fp div/sqrt", () => id_ctrl.fp && (io.fpu.dec.div || io.fpu.dec.sqrt)),
-      //  ("fp other",    () => id_ctrl.fp && !(io.fpu.dec.ldst || io.fpu.dec.fma ||
-      //                        io.fpu.dec.div || io.fpu.dec.sqrt))))),
-
     new freechips.rocketchip.rocket.EventSet((mask, hits) => (mask & hits).orR, Seq(
       ("I$ blocked",                        () => icache_blocked),
       ("nop",                               () => false.B),
@@ -227,128 +214,24 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
       ("flush",                             () => rob.io.flush.valid),
       ("branch resolved",                   () => br_unit.brinfo.valid))),
 
-      // Unused RocketCore HPE's
-      //("load-use interlock",     () => id_ex_hazard && ex_ctrl.mem || id_mem_hazard && mem_ctrl.mem ||
-      //                                 id_wb_hazard && wb_ctrl.mem),
-      //("long-latency interlock", () => id_sboard_hazard),
-      //("csr interlock",          () => id_ex_hazard && ex_ctrl.csr =/= CSR.N ||
-      //                                 id_mem_hazard && mem_ctrl.csr =/= CSR.N ||
-      //                                 id_wb_hazard && wb_ctrl.csr =/= CSR.N),
-      //("D$ blocked",             () => id_ctrl.mem && dcache_blocked),
-      //++ (if (!usingMulDiv) Seq() else Seq(
-      //  ("mul/div interlock", () => id_ex_hazard && ex_ctrl.div || id_mem_hazard &&
-      //                              mem_ctrl.div || id_wb_hazard && wb_ctrl.div)))
-      //++ (if (!usingFPU) Seq() else Seq(
-      //  ("fp interlock", () => id_ex_hazard && ex_ctrl.fp || id_mem_hazard && mem_ctrl.fp ||
-      //                         id_wb_hazard && wb_ctrl.fp || id_ctrl.fp && id_stall_fpu)))),
-
     new freechips.rocketchip.rocket.EventSet((mask, hits) => (mask & hits).orR, Seq(
       ("I$ miss",     () => io.ifu.perf.acquire),
-      ("D$ miss",     () => io.dmem.perf.acquire),
-      ("D$ release",  () => io.dmem.perf.release),
+//      ("D$ miss",     () => io.dmem.perf.acquire),
+//      ("D$ release",  () => io.dmem.perf.release),
       ("ITLB miss",   () => io.ifu.perf.tlbMiss),
-      ("DTLB miss",   () => io.dmem.perf.tlbMiss),
+//      ("DTLB miss",   () => io.dmem.perf.tlbMiss),
       ("L2 TLB miss", () => io.ptw.perf.l2miss)))))
 
-  val csr = Module(new freechips.rocketchip.rocket.CSRFile(perfEvents))
+  val csr = Module(new freechips.rocketchip.rocket.CSRFile(perfEvents, boomParams.customCSRs.decls))
   csr.io.inst foreach { c => c := DontCare }
-  csr.io.rocc_interrupt := DontCare
+  csr.io.rocc_interrupt := io.rocc.interrupt
+
+  val custom_csrs = Wire(new BoomCustomCSRs)
+  (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs := rhs }
 
   // evaluate performance counters
   val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }
-
-  // Old BOOM Core HPE's
-  //// User-level instruction count.
-  //csr.io.events(2) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && (csr.io.status.prv === UInt(freechips.rocketchip.rocket.PRV.U))})
-
-  //csr.io.events(5)  := csr.io.status.prv === UInt(freechips.rocketchip.rocket.PRV.U)
-
-  //// Instruction mixes.
-  //csr.io.events(6)  := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && !rob.io.commit.uops(w).is_jal})
-  //csr.io.events(7)  := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_jal})
-  //csr.io.events(8)  := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_jump && !rob.io.commit.uops(w).is_jal})
-  //csr.io.events(9)  := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_load})
-  //csr.io.events(10) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_store})
-  //csr.io.events(11) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).fp_val})
-
-  //// Decode stall causes.
-  //csr.io.events(12) := !rob.io.ready
-  //csr.io.events(13) := lsu.io.laq_full
-  //csr.io.events(14) := lsu.io.stq_full
-  //csr.io.events(15) := !dis_readys.asBools.reduce(_&_) // issue queues
-  //csr.io.events(16) := branch_mask_full.reduce(_|_)
-  //csr.io.events(17) := rob.io.flush.valid
-
-  //// LSU Speculation stats.
-  //csr.io.events(18) := lsu.io.counters.ld_valid
-  //csr.io.events(19) := lsu.io.counters.stld_order_fail
-  //csr.io.events(20) := lsu.io.counters.ldld_order_fail
-
-  //// Branch prediction stats.
-  //csr.io.events(21)  := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && !rob.io.commit.uops(w).is_jal &&
-  //   rob.io.commit.uops(w).stat_brjmp_mispredicted})
-  //csr.io.events(22) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && !rob.io.commit.uops(w).is_jal &&
-  //   rob.io.commit.uops(w).stat_btb_made_pred})
-  //csr.io.events(23) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && !rob.io.commit.uops(w).is_jal &&
-  //   rob.io.commit.uops(w).stat_btb_mispredicted})
-  //csr.io.events(24) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && !rob.io.commit.uops(w).is_jal &&
-  //   rob.io.commit.uops(w).stat_bpd_made_pred})
-  //csr.io.events(25) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && !rob.io.commit.uops(w).is_jal &&
-  //   rob.io.commit.uops(w).stat_bpd_mispredicted})
-
-  //// Branch prediction - no prediction made.
-  //csr.io.events(26) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && !rob.io.commit.uops(w).is_jal &&
-  //   !rob.io.commit.uops(w).stat_btb_made_pred && !rob.io.commit.uops(w).stat_bpd_made_pred})
-
-  //// Branch prediction - no predition made & a mispredict occurred.
-  //csr.io.events(27) := PopCount((Range(0,coreWidth)).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && !rob.io.commit.uops(w).is_jal &&
-  //   !rob.io.commit.uops(w).stat_btb_made_pred && !rob.io.commit.uops(w).stat_bpd_made_pred &&
-  //   rob.io.commit.uops(w).stat_brjmp_mispredicted})
-
-  //// Count user-level branches (subtract from total to get privilege branch accuracy)
-  //csr.io.events(28) := br_unit.brinfo.valid && (csr.io.status.prv === UInt(freechips.rocketchip.rocket.PRV.U))
-  //csr.io.events(29) := br_unit.brinfo.mispredict && (csr.io.status.prv === UInt(rocket.PRV.U))
-
-  //// count change of privilege modes
-  //csr.io.events(30) := csr.io.status.prv =/= RegNext(csr.io.status.prv)
-
-  //csr.io.events(31) := !issue_units(0).io.dis_readys.reduce(_&_)
-  //csr.io.events(32) := !issue_units(1).io.dis_readys.reduce(_&_)
-  //csr.io.events(33) := !fp_pipeline.io.dis_readys.reduce(_&_)
-
-  //assert (!(Range(0,coreWidth).map{w =>
-  //   rob.io.commit.valids(w) && rob.io.commit.uops(w).is_br_or_jmp && rob.io.commit.uops(w).is_jal &&
-  //   rob.io.commit.uops(w).stat_brjmp_mispredicted}.reduce(_|_)),
-  //   "[dpath] A committed JAL was marked as having been mispredicted.")
-
-  //// Count issued instructions (only integer currently).
-  //require (log2Ceil(1+iss_valids.length) <= csr.io.events(0).getWidth) // CSR.scala sets increment width.
-  //csr.io.events(34) := PopCount(iss_valids)
-
-  //// Count not-issued slots due to empty issue windows (only integer currently).
-  //val not_issued_and_empty = for {iu <- issue_units; iss_valid <- iu.io.iss_valids} yield {
-  //      !iss_valid && iu.io.event_empty }
-  //csr.io.events(35) := PopCount(not_issued_and_empty)
-
-  //// Count not-issued slots due to backend hazards/unsatisified dependencies (only integer currently).
-  //val not_issued_and_not_empty = for {iu <- issue_units; iss_valid <- iu.io.iss_valids} yield {
-  //      !iss_valid && !iu.io.event_empty}
-  //csr.io.events(36) := PopCount(not_issued_and_not_empty)
 
   //****************************************
   // Time Stamp Counter & Retired Instruction Counter
@@ -367,48 +250,51 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
     if (enableAgePriorityIssue) " (Age-based Priority)"
     else " (Unordered Priority)"
 
-  val exeUnitsStr = exe_units.toString
+  val btbStr =
+    if (enableBTB) ("" + boomParams.btb.nSets * boomParams.btb.nWays + " entries (" + boomParams.btb.nSets + " x " + boomParams.btb.nWays + " ways)")
+    else 0
+
   val fpPipelineStr =
-    if (usingFPU) fp_pipeline.fpString
+    if (usingFPU) fp_pipeline.toString
     else ""
-  val robStr = rob.toString
 
   override def toString: String =
-    ( exeUnitsStr + "\n"
+    (BoomCoreStringPrefix("====Overall Core Params====") + "\n"
+    + exe_units.toString + "\n"
     + fpPipelineStr + "\n"
-    + robStr + "\n"
-    + "\n   [Core " + hartId + "] ==Overall Core Params=="
-    + "\n   [Core " + hartId + "] Fetch Width           : " + fetchWidth
-    + "\n   [Core " + hartId + "] Decode Width          : " + coreWidth
-    + "\n   [Core " + hartId + "] Issue Width           : " + issueParams.map(_.issueWidth).sum
-    + "\n   [Core " + hartId + "] ROB Size              : " + numRobEntries
-    + "\n   [Core " + hartId + "] Issue Window Size     : " + issueParams.map(_.numEntries) + issStr
-    + "\n   [Core " + hartId + "] Load/Store Unit Size  : " + NUM_LDQ_ENTRIES + "/" + NUM_STQ_ENTRIES
-    + "\n   [Core " + hartId + "] Num Int Phys Registers: " + numIntPhysRegs
-    + "\n   [Core " + hartId + "] Num FP  Phys Registers: " + numFpPhysRegs
-    + "\n   [Core " + hartId + "] Max Branch Count      : " + MAX_BR_COUNT
-    + "\n   [Core " + hartId + "] BTB Size              : "
-    + (if (enableBTB) ("" + boomParams.btb.nSets * boomParams.btb.nWays + " entries (" +
-         boomParams.btb.nSets + " x " + boomParams.btb.nWays + " ways)") else 0)
-    + "\n   [Core " + hartId + "] RAS Size              : " + (if (enableBTB) boomParams.btb.nRAS else 0)
-    + "\n   [Core " + hartId + "] Rename  Stage Latency : " + renameLatency
-    + "\n" + iregfile.toString
-    + "\n   [Core " + hartId + "] Num Slow Wakeup Ports : " + numIrfWritePorts
-    + "\n   [Core " + hartId + "] Num Fast Wakeup Ports : " + exe_units.count(_.bypassable)
-    + "\n   [Core " + hartId + "] Num Bypass Ports      : " + exe_units.numTotalBypassPorts
-    + "\n   [Core " + hartId + "] DCache Ways           : " + dcacheParams.nWays
-    + "\n   [Core " + hartId + "] DCache Sets           : " + dcacheParams.nSets
-    + "\n   [Core " + hartId + "] DCache nMSHRs         : " + dcacheParams.nMSHRs
-    + "\n   [Core " + hartId + "] ICache Ways           : " + icacheParams.nWays
-    + "\n   [Core " + hartId + "] ICache Sets           : " + icacheParams.nSets
-    + "\n   [Core " + hartId + "] D-TLB Entries         : " + dcacheParams.nTLBEntries
-    + "\n   [Core " + hartId + "] I-TLB Entries         : " + icacheParams.nTLBEntries
-    + "\n   [Core " + hartId + "] Paddr Bits            : " + paddrBits
-    + "\n   [Core " + hartId + "] Vaddr Bits            : " + vaddrBits
-    + "\n\n   [Core " + hartId + "] Using FPU Unit?       : " + usingFPU.toString
-    + "\n   [Core " + hartId + "] Using FDivSqrt?       : " + usingFDivSqrt.toString
-    + "\n   [Core " + hartId + "] Using VM?             : " + usingVM.toString
-    + "\n")
+    + rob.toString + "\n"
+    + BoomCoreStringPrefix(
+        "===Other Core Params===",
+        "Fetch Width           : " + fetchWidth,
+        "Decode Width          : " + coreWidth,
+        "Issue Width           : " + issueParams.map(_.issueWidth).sum,
+        "ROB Size              : " + numRobEntries,
+        "Issue Window Size     : " + issueParams.map(_.numEntries) + issStr,
+        "Load/Store Unit Size  : " + numLdqEntries + "/" + numStqEntries,
+        "Num Int Phys Registers: " + numIntPhysRegs,
+        "Num FP  Phys Registers: " + numFpPhysRegs,
+        "Max Branch Count      : " + maxBrCount)
+    + BoomCoreStringPrefix(
+        "RAS Size              : " + (if (enableBTB) boomParams.btb.nRAS else 0)) + "\n"
+    + iregfile.toString + "\n"
+    + BoomCoreStringPrefix(
+        "Num Slow Wakeup Ports : " + numIrfWritePorts,
+        "Num Fast Wakeup Ports : " + exe_units.count(_.bypassable),
+        "Num Bypass Ports      : " + exe_units.numTotalBypassPorts) + "\n"
+    + BoomCoreStringPrefix(
+        "DCache Ways           : " + dcacheParams.nWays,
+        "DCache Sets           : " + dcacheParams.nSets,
+        "DCache nMSHRs         : " + dcacheParams.nMSHRs,
+        "ICache Ways           : " + icacheParams.nWays,
+        "ICache Sets           : " + icacheParams.nSets,
+        "D-TLB Entries         : " + dcacheParams.nTLBEntries,
+        "I-TLB Entries         : " + icacheParams.nTLBEntries,
+        "Paddr Bits            : " + paddrBits,
+        "Vaddr Bits            : " + vaddrBits) + "\n"
+    + BoomCoreStringPrefix(
+        "Using FPU Unit?       : " + usingFPU.toString,
+        "Using FDivSqrt?       : " + usingFDivSqrt.toString,
+        "Using VM?             : " + usingVM.toString) + "\n")
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
@@ -419,13 +305,23 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   io.ifu.br_unit := br_unit
   io.ifu.tsc_reg := debug_tsc_reg
 
+  // Breakpoint info
+  io.ifu.status  := csr.io.status
+  io.ifu.bp      := csr.io.bp
+
   // SFence needs access to the PC to inject an address into the TLB's CAM port. The ROB
   // will have to later redirect the PC back to the regularly scheduled program.
-  io.ifu.sfence_take_pc    := lsu.io.exe_resp.bits.sfence.valid
-  io.ifu.sfence_addr       := lsu.io.exe_resp.bits.sfence.bits.addr
+  io.ifu.sfence_take_pc := false.B
+  io.ifu.sfence_addr    := DontCare
+  for (i <- 0 until memWidth) {
+    when (io.lsu.exe(i).req.bits.sfence.valid) {
+      io.ifu.sfence_take_pc    := true.B
+      io.ifu.sfence_addr       := io.lsu.exe(i).req.bits.sfence.bits.addr
+    }
+  }
 
   // We must redirect the PC the cycle after playing the SFENCE game.
-  io.ifu.flush_take_pc     := rob.io.flush.valid || RegNext(lsu.io.exe_resp.bits.sfence.valid)
+  io.ifu.flush_take_pc     := rob.io.flush.valid || RegNext(io.ifu.sfence_take_pc)
 
   // TODO FIX THIS HACK
   // The below code works because of two quirks with the flush mechanism
@@ -441,9 +337,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
                                   RegNext(csr.io.evec))
   io.ifu.com_ftq_idx       := rob.io.com_xcpt.bits.ftq_idx
 
-  io.ifu.clear_fetchbuffer := br_unit.brinfo.mispredict ||
-                              rob.io.flush.valid ||
-                              io.ifu.sfence_take_pc
+  io.ifu.clear_fetchbuffer := flush_ifu
 
   io.ifu.flush_info.valid  := rob.io.flush.valid
   io.ifu.flush_info.bits   := rob.io.flush.bits
@@ -458,7 +352,14 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
     (br_unit.brinfo.mispredict && br_unit.brinfo.is_jr &&  csr.io.status.debug)
 
   // Delay sfence to match pushing the sfence.addr into the TLB's CAM port.
-  io.ifu.sfence := RegNext(lsu.io.exe_resp.bits.sfence)
+  io.ifu.sfence.valid := false.B
+  io.ifu.sfence.bits  := DontCare
+  for (i <- 0 until memWidth) {
+    when (RegNext(io.lsu.exe(i).req.bits.sfence.valid)) {
+      io.ifu.sfence.valid := true.B
+      io.ifu.sfence.bits  := RegNext(io.lsu.exe(i).req.bits.sfence.bits)
+    }
+  }
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
@@ -486,19 +387,11 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   //-------------------------------------------------------------
   // Pull out instructions and send to the Decoders
 
-  io.ifu.fetchpacket.ready := dec_rdy
+  io.ifu.fetchpacket.ready := dec_ready
   val dec_fbundle = io.ifu.fetchpacket.bits
 
   //-------------------------------------------------------------
   // Decoders
-
-  // allow early instructions to stall later instructions
-  var dec_stall_next_inst = false.B
-  var dec_last_inst_was_stalled = false.B
-
-  // send only 1 RoCC instructions at a time
-  var dec_rocc_found = if (usingRoCC) exe_units.rocc_unit.io.rocc.rxq_full else false.B
-  val rocc_shim_busy = if (usingRoCC) !exe_units.rocc_unit.io.rocc.rxq_empty else false.B
 
   // stall fetch/dcode because we ran out of branch tags
   val branch_mask_full = Wire(Vec(coreWidth, Bool()))
@@ -512,43 +405,61 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
     decode_units(w).io.interrupt       := csr.io.interrupt
     decode_units(w).io.interrupt_cause := csr.io.interrupt_cause
 
-    val prev_insts_in_bundle_valid = Range(0,w).map{i => dec_valids(i)}.foldLeft(false.B)(_|_)
-
-    // stall this instruction?
-    // TODO tailor this to only care if a given instruction uses a resource?
-    val stall_me = (dec_valids(w) &&
-                     (  !(rename_stage.io.inst_can_proceed(w))
-                     || (dec_uops(w).is_unique &&
-                        (!(rob.io.empty) || !lsu.io.lsu_fencei_rdy || prev_insts_in_bundle_valid))
-                     || !rob.io.ready
-                     || lsu.io.laq_full(w) && dec_uops(w).is_load
-                     || lsu.io.stq_full(w) && dec_uops(w).is_store
-                     || branch_mask_full(w)
-                     || br_unit.brinfo.mispredict
-                     || rob.io.flush.valid
-                     || dec_stall_next_inst
-                     || ((dec_uops(w).is_fence || dec_uops(w).is_fencei) && (io.rocc.busy || rocc_shim_busy))
-                     || (dec_uops(w).is_fencei && !lsu.io.lsu_fencei_rdy)
-                     || (dec_uops(w).uopc === uopROCC && dec_rocc_found)
-                     )) ||
-                   dec_last_inst_was_stalled
-
-    // stall the next instruction following me in the decode bundle?
-    dec_last_inst_was_stalled = stall_me
-    dec_stall_next_inst = stall_me || (dec_valids(w) && dec_uops(w).is_unique)
-    dec_rocc_found = dec_rocc_found || (dec_valids(w) && dec_uops(w).uopc === uopROCC)
-
-    dec_will_fire(w) := dec_valids(w) && !stall_me && !io.ifu.clear_fetchbuffer
-    dec_uops(w)      := decode_units(w).io.deq.uop
+    dec_uops(w) := decode_units(w).io.deq.uop
   }
 
-  // all decoders are empty and ready for new instructions
-  dec_rdy := !(dec_stall_next_inst)
+  //-------------------------------------------------------------
+  // FTQ GetPC Port Arbitration
 
-  when (dec_rdy || io.ifu.clear_fetchbuffer) {
+  val bru_pc_req  = Wire(Decoupled(UInt(log2Ceil(ftqSz).W)))
+  val xcpt_pc_req = Wire(Decoupled(UInt(log2Ceil(ftqSz).W)))
+
+  val ftq_arb = Module(new Arbiter(UInt(log2Ceil(ftqSz).W), 2))
+
+  ftq_arb.io.in(0) <> bru_pc_req
+  ftq_arb.io.in(1) <> xcpt_pc_req
+
+  // Hookup FTQ
+  io.ifu.get_pc.ftq_idx := ftq_arb.io.out.bits
+  ftq_arb.io.out.ready  := true.B
+
+  // Branch Unit Requests
+  bru_pc_req.valid := RegNext(iss_valids(brunit_idx))
+  bru_pc_req.bits  := RegNext(iss_uops(brunit_idx).ftq_idx)
+  exe_units(brunit_idx).io.get_ftq_pc.fetch_pc := RegNext(io.ifu.get_pc.fetch_pc)
+  exe_units(brunit_idx).io.get_ftq_pc.next_val := RegNext(io.ifu.get_pc.next_val)
+  exe_units(brunit_idx).io.get_ftq_pc.next_pc  := RegNext(io.ifu.get_pc.next_pc)
+
+  // Frontend Exception Requests
+  val xcpt_idx = PriorityEncoder(dec_xcpts)
+  xcpt_pc_req.valid    := dec_xcpts.reduce(_||_)
+  xcpt_pc_req.bits     := dec_uops(xcpt_idx).ftq_idx
+  rob.io.xcpt_fetch_pc := RegEnable(io.ifu.get_pc.fetch_pc, dis_ready)
+
+  //-------------------------------------------------------------
+  // Decode/Rename1 pipeline logic
+
+  dec_xcpts := dec_uops zip dec_valids map {case (u,v) => u.exception && v}
+  val dec_xcpt_stall = dec_xcpts.reduce(_||_) && !xcpt_pc_req.ready
+
+  val dec_hazards = (0 until coreWidth).map(w =>
+                      dec_valids(w) &&
+                      (  !dis_ready
+                      || rob.io.commit.rollback
+                      || dec_xcpt_stall
+                      || branch_mask_full(w)
+                      || flush_ifu))
+
+  val dec_stalls = dec_hazards.scanLeft(false.B) ((s,h) => s || h).takeRight(coreWidth)
+  dec_fire := (0 until coreWidth).map(w => dec_valids(w) && !dec_stalls(w))
+
+  // all decoders are empty and ready for new instructions
+  dec_ready := dec_fire.last
+
+  when (dec_ready || flush_ifu) {
     dec_finished_mask := 0.U
   } .otherwise {
-    dec_finished_mask := dec_will_fire.asUInt | dec_finished_mask
+    dec_finished_mask := dec_fire.asUInt | dec_finished_mask
   }
 
   //-------------------------------------------------------------
@@ -559,9 +470,8 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
 
   for (w <- 0 until coreWidth) {
     dec_brmask_logic.io.is_branch(w) := !dec_finished_mask(w) && dec_uops(w).allocate_brtag
-    dec_brmask_logic.io.will_fire(w) :=  dec_will_fire(w) &&
+    dec_brmask_logic.io.will_fire(w) :=  dec_fire(w) &&
                                          dec_uops(w).allocate_brtag // ren, dis can back pressure us
-
     dec_uops(w).br_tag  := dec_brmask_logic.io.br_tag(w)
     dec_uops(w).br_mask := dec_brmask_logic.io.br_mask(w)
   }
@@ -569,131 +479,62 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   branch_mask_full := dec_brmask_logic.io.is_full
 
   //-------------------------------------------------------------
-  // LD/ST Unit Allocation Logic
-
-  for (w <- 0 until decodeWidth) {
-    dec_uops(w).ldq_idx := lsu.io.new_ldq_idx(w)
-    dec_uops(w).stq_idx := lsu.io.new_stq_idx(w)
-  }
-
-  //-------------------------------------------------------------
-  // RoCC allocation logic
-  if (usingRoCC) {
-    for (w <- 0 until coreWidth) {
-      // We guarantee only decoding 1 RoCC instruction per cycle
-      dec_uops(w).rxq_idx := exe_units.rocc_unit.io.rocc.rxq_idx
-    }
-  }
-
-  //-------------------------------------------------------------
-  // Rob Allocation Logic
-
-  for (w <- 0 until coreWidth) {
-    // note: this assumes uops haven't been shifted - there's a 1:1 match between PC's LSBs and "w" here
-    // (thus the LSB of the rob_idx gives part of the PC)
-    if (coreWidth == 1) {
-       dec_uops(w).rob_idx := rob.io.rob_tail_idx
-    } else {
-      dec_uops(w).rob_idx := Cat(rob.io.rob_tail_idx >> log2Ceil(coreWidth).U,
-                                 w.U(log2Ceil(coreWidth).W))
-    }
-  }
-
-  val dec_has_br_or_jalr_in_packet =
-    (dec_valids zip dec_uops map {case(v,u) => v && u.is_br_or_jmp && !u.is_jal}).reduce(_|_)
-
-  //-------------------------------------------------------------
   //-------------------------------------------------------------
   // **** Register Rename Stage ****
   //-------------------------------------------------------------
   //-------------------------------------------------------------
-  rename_stage.io.kill     := io.ifu.clear_fetchbuffer // mispredict or flush
-  rename_stage.io.brinfo   := br_unit.brinfo
 
-  rename_stage.io.flush_pipeline := rob.io.flush.valid
-  rename_stage.io.debug_rob_empty := rob.io.empty
+  // Inputs
+  for (rename <- rename_stages) {
+    rename.io.kill := flush_ifu
+    rename.io.brinfo := br_unit.brinfo
 
-  rename_stage.io.dec_will_fire := dec_will_fire
-  rename_stage.io.dec_uops := dec_uops
+    rename.io.debug_rob_empty := rob.io.empty
 
-  var iss_wu_idx = 1
-  var ren_wu_idx = 1
-  // The 0th wakeup port goes to the ll_wbarb
-  int_iss_wakeups(0).valid := ll_wbarb.io.out.fire() && ll_wbarb.io.out.bits.uop.dst_rtype === RT_FIX
-  int_iss_wakeups(0).bits  := ll_wbarb.io.out.bits
+    rename.io.dec_fire := dec_fire
+    rename.io.dec_uops := dec_uops
 
-  int_ren_wakeups(0).valid := ll_wbarb.io.out.fire() && ll_wbarb.io.out.bits.uop.dst_rtype === RT_FIX
-  int_ren_wakeups(0).bits  := ll_wbarb.io.out.bits
+    rename.io.dis_fire := dis_fire
+    rename.io.dis_ready := dis_ready
 
-  // loop through each issue-port (exe_units are statically connected to an issue-port)
-  for (i <- 0 until exe_units.length) {
-    if (exe_units(i).writesIrf) {
-      val fast_wakeup = Wire(Valid(new ExeUnitResp(xLen)))
-      val slow_wakeup = Wire(Valid(new ExeUnitResp(xLen)))
-      fast_wakeup := DontCare
-      slow_wakeup := DontCare
-
-      val resp = exe_units(i).io.iresp
-      assert(!(resp.valid && resp.bits.uop.ctrl.rf_wen && resp.bits.uop.dst_rtype =/= RT_FIX))
-
-      // Fast Wakeup (uses just-issued uops) that have known latencies.
-      fast_wakeup.bits.uop := iss_uops(i)
-      fast_wakeup.valid    := iss_valids(i) &&
-                                iss_uops(i).bypassable &&
-                                iss_uops(i).dst_rtype === RT_FIX &&
-                                iss_uops(i).ldst_val
-
-      // Slow Wakeup (uses write-port to register file)
-      slow_wakeup.bits.uop := resp.bits.uop
-      slow_wakeup.valid    := resp.valid &&
-                                resp.bits.uop.ctrl.rf_wen &&
-                                !resp.bits.uop.bypassable &&
-                                resp.bits.uop.dst_rtype === RT_FIX
-
-      if (exe_units(i).bypassable) {
-        int_iss_wakeups(iss_wu_idx) := fast_wakeup
-        iss_wu_idx += 1
-      }
-      if (!exe_units(i).alwaysBypassable) {
-        int_iss_wakeups(iss_wu_idx) := slow_wakeup
-        iss_wu_idx += 1
-      }
-
-      if (exe_units(i).bypassable && enableFastWakeupsToRename) {
-        int_ren_wakeups(ren_wu_idx) := fast_wakeup
-        ren_wu_idx += 1
-      }
-      if (!exe_units(i).alwaysBypassable || !enableFastWakeupsToRename) {
-        int_ren_wakeups(ren_wu_idx) := slow_wakeup
-        ren_wu_idx += 1
-      }
-    }
-  }
-  require (iss_wu_idx == numIntIssueWakeupPorts)
-  require (ren_wu_idx == numIntRenameWakeupPorts)
-  require (iss_wu_idx == ren_wu_idx || !enableFastWakeupsToRename)
-
-  // Perform load-hit speculative wakeup through a special port (performs a poison wake-up).
-  issue_units map { iu =>
-    iu.io.mem_ldSpecWakeup <> lsu.io.mem_ldSpecWakeup
+    rename.io.com_valids := rob.io.commit.valids
+    rename.io.com_uops := rob.io.commit.uops
+    rename.io.rbk_valids := rob.io.commit.rbk_valids
+    rename.io.rollback := rob.io.commit.rollback
   }
 
-  for ((renport, intport) <- rename_stage.io.int_wakeups zip int_ren_wakeups) {
-    // Stop wakeup for bypassable children of spec-loads trying to issue during a ldMiss.
-    renport.valid :=
-       intport.valid &&
-       !(sxt_ldMiss && (intport.bits.uop.iw_p1_poisoned || intport.bits.uop.iw_p2_poisoned))
-    renport.bits := intport.bits
-  }
-  if (usingFPU) {
-    for ((renport, fpport) <- rename_stage.io.fp_wakeups zip fp_pipeline.io.wakeups) {
-       renport <> fpport
-    }
-  }
+  // Outputs
+  dis_uops := rename_stage.io.ren2_uops
+  dis_valids := rename_stage.io.ren2_mask
+  ren_stalls := rename_stage.io.ren_stalls
 
-  rename_stage.io.com_valids := rob.io.commit.valids
-  rename_stage.io.com_uops := rob.io.commit.uops
-  rename_stage.io.com_rbk_valids := rob.io.commit.rbk_valids
+
+  /**
+   * TODO This is a bit nasty, but it's currently necessary to
+   * split the INT/FP rename pipelines into separate instantiations.
+   * Won't have to do this anymore with a properly decoupled FP pipeline.
+   */
+  for (w <- 0 until coreWidth) {
+    val i_uop   = rename_stage.io.ren2_uops(w)
+    val f_uop   = if (usingFPU) fp_rename_stage.io.ren2_uops(w) else NullMicroOp
+    val f_stall = if (usingFPU) fp_rename_stage.io.ren_stalls(w) else false.B
+
+    // lrs1 can "pass through" to prs1. Used solely to index the csr file.
+    dis_uops(w).prs1 := Mux(dis_uops(w).lrs1_rtype === RT_FLT, f_uop.prs1,
+                        Mux(dis_uops(w).lrs1_rtype === RT_FIX, i_uop.prs1, dis_uops(w).lrs1))
+    dis_uops(w).prs2 := Mux(dis_uops(w).lrs2_rtype === RT_FLT, f_uop.prs2, i_uop.prs2)
+    dis_uops(w).prs3 := f_uop.prs3
+    dis_uops(w).pdst := Mux(dis_uops(w).dst_rtype  === RT_FLT, f_uop.pdst, i_uop.pdst)
+    dis_uops(w).stale_pdst := Mux(dis_uops(w).dst_rtype === RT_FLT, f_uop.stale_pdst, i_uop.stale_pdst)
+
+    dis_uops(w).prs1_busy := i_uop.prs1_busy && (dis_uops(w).lrs1_rtype === RT_FIX) ||
+                             f_uop.prs1_busy && (dis_uops(w).lrs1_rtype === RT_FLT)
+    dis_uops(w).prs2_busy := i_uop.prs2_busy && (dis_uops(w).lrs2_rtype === RT_FIX) ||
+                             f_uop.prs2_busy && (dis_uops(w).lrs2_rtype === RT_FLT)
+    dis_uops(w).prs3_busy := f_uop.prs3_busy && dis_uops(w).frs3_en
+
+    ren_stalls(w) := rename_stage.io.ren_stalls(w) || f_stall
+  }
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
@@ -701,13 +542,87 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   //-------------------------------------------------------------
   //-------------------------------------------------------------
 
-  // Get uops from rename 2, and backpressure ren2 if necessary
-  rename_stage.io.dis_inst_can_proceed := VecInit(dispatcher.io.ren_uops.map(_.ready))
+  //-------------------------------------------------------------
+  // Rename2/Dispatch pipeline logic
+
+  val dis_prior_slot_valid = dis_valids.scanLeft(false.B) ((s,v) => s || v)
+  val dis_prior_slot_unique = (dis_uops zip dis_valids).scanLeft(false.B) {case (s,(u,v)) => s || v && u.is_unique}
+  val wait_for_empty_pipeline = (0 until coreWidth).map(w => (dis_uops(w).is_unique || custom_csrs.disableOOO) &&
+                                  (!rob.io.empty || !io.lsu.fencei_rdy || dis_prior_slot_valid(w)))
+  val rocc_shim_busy = if (usingRoCC) !exe_units.rocc_unit.io.rocc.rxq_empty else false.B
+  val wait_for_rocc = (0 until coreWidth).map(w =>
+                        (dis_uops(w).is_fence || dis_uops(w).is_fencei) && (io.rocc.busy || rocc_shim_busy))
+  val rxq_full = if (usingRoCC) exe_units.rocc_unit.io.rocc.rxq_full else false.B
+  val block_rocc = (dis_uops zip dis_valids).map{case (u,v) => v && u.uopc === uopROCC}.scanLeft(rxq_full)(_||_)
+  val dis_rocc_alloc_stall = (dis_uops.map(_.uopc === uopROCC) zip block_rocc) map {case (p,r) =>
+                               if (usingRoCC) p && r else false.B}
+
+  val dis_hazards = (0 until coreWidth).map(w =>
+                      dis_valids(w) &&
+                      (  !rob.io.ready
+                      || ren_stalls(w)
+                      || io.lsu.ldq_full(w) && dis_uops(w).uses_ldq
+                      || io.lsu.stq_full(w) && dis_uops(w).uses_stq
+                      || !dispatcher.io.ren_uops(w).ready
+                      || wait_for_empty_pipeline(w)
+                      || wait_for_rocc(w)
+                      || dis_prior_slot_unique(w)
+                      || dis_rocc_alloc_stall(w)
+                      || flush_ifu))
+
+
+  io.lsu.fence_dmem := (dis_valids zip wait_for_empty_pipeline).map {case (v,w) => v && w} .reduce(_||_)
+
+  val dis_stalls = dis_hazards.scanLeft(false.B) ((s,h) => s || h).takeRight(coreWidth)
+  dis_fire := dis_valids zip dis_stalls map {case (v,s) => v && !s}
+  dis_ready := !dis_stalls.last
+
+  //-------------------------------------------------------------
+  // LDQ/STQ Allocation Logic
+
   for (w <- 0 until coreWidth) {
-    dispatcher.io.ren_uops(w).valid := rename_stage.io.ren2_mask(w)
-    dispatcher.io.ren_uops(w).bits  := GetNewUopAndBrMask(rename_stage.io.ren2_uops(w), br_unit.brinfo)
+    // Dispatching instructions request load/store queue entries when they can proceed.
+    dis_uops(w).ldq_idx := io.lsu.dis_ldq_idx(w)
+    dis_uops(w).stq_idx := io.lsu.dis_stq_idx(w)
   }
 
+  //-------------------------------------------------------------
+  // Rob Allocation Logic
+
+  rob.io.enq_valids := dis_fire
+  rob.io.enq_uops   := dis_uops
+  rob.io.enq_partial_stall := dis_stalls.last // TODO come up with better ROB compacting scheme.
+  rob.io.debug_tsc := debug_tsc_reg
+  rob.io.csr_stall := csr.io.csr_stall
+
+  for (w <- 0 until coreWidth) {
+    // note: this assumes uops haven't been shifted - there's a 1:1 match between PC's LSBs and "w" here
+    // (thus the LSB of the rob_idx gives part of the PC)
+    if (coreWidth == 1) {
+      dis_uops(w).rob_idx := rob.io.rob_tail_idx
+    } else {
+      dis_uops(w).rob_idx := Cat(rob.io.rob_tail_idx >> log2Ceil(coreWidth).U,
+                               w.U(log2Ceil(coreWidth).W))
+    }
+  }
+
+  //-------------------------------------------------------------
+  // RoCC allocation logic
+  if (usingRoCC) {
+    for (w <- 0 until coreWidth) {
+      // We guarantee only decoding 1 RoCC instruction per cycle
+      dis_uops(w).rxq_idx := exe_units.rocc_unit.io.rocc.rxq_idx(w)
+    }
+  }
+
+  //-------------------------------------------------------------
+  // Dispatch to issue queues
+
+  // Get uops from rename2
+  for (w <- 0 until coreWidth) {
+    dispatcher.io.ren_uops(w).valid := dis_fire(w)
+    dispatcher.io.ren_uops(w).bits  := dis_uops(w)
+  }
 
   var iu_idx = 0
   // Send dispatched uops to correct issue queues
@@ -729,10 +644,94 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
 
   require (issue_units.map(_.issueWidth).sum == exe_units.length)
 
-  // Output (Issue)
+  var iss_wu_idx = 1
+  var ren_wu_idx = 1
+  // The 0th wakeup port goes to the ll_wbarb
+  int_iss_wakeups(0).valid := ll_wbarb.io.out.fire() && ll_wbarb.io.out.bits.uop.dst_rtype === RT_FIX
+  int_iss_wakeups(0).bits  := ll_wbarb.io.out.bits
+
+  int_ren_wakeups(0).valid := ll_wbarb.io.out.fire() && ll_wbarb.io.out.bits.uop.dst_rtype === RT_FIX
+  int_ren_wakeups(0).bits  := ll_wbarb.io.out.bits
+
+  for (i <- 1 until memWidth) {
+    int_iss_wakeups(i).valid := mem_resps(i).valid && mem_resps(i).bits.uop.dst_rtype === RT_FIX
+    int_iss_wakeups(i).bits  := mem_resps(i).bits
+
+    int_ren_wakeups(i).valid := mem_resps(i).valid && mem_resps(i).bits.uop.dst_rtype === RT_FIX
+    int_ren_wakeups(i).bits  := mem_resps(i).bits
+    iss_wu_idx += 1
+    ren_wu_idx += 1
+  }
+
+  // loop through each issue-port (exe_units are statically connected to an issue-port)
+  for (i <- 0 until exe_units.length) {
+    if (exe_units(i).writesIrf) {
+      val fast_wakeup = Wire(Valid(new ExeUnitResp(xLen)))
+      val slow_wakeup = Wire(Valid(new ExeUnitResp(xLen)))
+      fast_wakeup := DontCare
+      slow_wakeup := DontCare
+
+      val resp = exe_units(i).io.iresp
+      assert(!(resp.valid && resp.bits.uop.rf_wen && resp.bits.uop.dst_rtype =/= RT_FIX))
+
+      // Fast Wakeup (uses just-issued uops that have known latencies)
+      fast_wakeup.bits.uop := iss_uops(i)
+      fast_wakeup.valid    := iss_valids(i) &&
+                                iss_uops(i).bypassable &&
+                                iss_uops(i).dst_rtype === RT_FIX &&
+                                iss_uops(i).ldst_val
+
+      // Slow Wakeup (uses write-port to register file)
+      slow_wakeup.bits.uop := resp.bits.uop
+      slow_wakeup.valid    := resp.valid &&
+                                resp.bits.uop.rf_wen &&
+                                !resp.bits.uop.bypassable &&
+                                resp.bits.uop.dst_rtype === RT_FIX
+
+      if (exe_units(i).bypassable) {
+        int_iss_wakeups(iss_wu_idx) := fast_wakeup
+        iss_wu_idx += 1
+      }
+      if (!exe_units(i).alwaysBypassable) {
+        int_iss_wakeups(iss_wu_idx) := slow_wakeup
+        iss_wu_idx += 1
+      }
+
+      if (exe_units(i).bypassable) {
+        int_ren_wakeups(ren_wu_idx) := fast_wakeup
+        ren_wu_idx += 1
+      }
+      if (!exe_units(i).alwaysBypassable) {
+        int_ren_wakeups(ren_wu_idx) := slow_wakeup
+        ren_wu_idx += 1
+      }
+    }
+  }
+  require (iss_wu_idx == numIntIssueWakeupPorts)
+  require (ren_wu_idx == numIntRenameWakeupPorts)
+  require (iss_wu_idx == ren_wu_idx)
+
+  // Perform load-hit speculative wakeup through a special port (performs a poison wake-up).
+  issue_units map { iu =>
+     iu.io.spec_ld_wakeup := io.lsu.spec_ld_wakeup
+  }
+
+  for ((renport, intport) <- rename_stage.io.wakeups zip int_ren_wakeups) {
+    // Stop wakeup for bypassable children of spec-loads trying to issue during a ldMiss.
+    renport.valid :=
+       intport.valid &&
+       !(io.lsu.ld_miss && (intport.bits.uop.iw_p1_poisoned || intport.bits.uop.iw_p2_poisoned))
+    renport.bits := intport.bits
+  }
+  if (usingFPU) {
+    for ((renport, fpport) <- fp_rename_stage.io.wakeups zip fp_pipeline.io.wakeups) {
+       renport <> fpport
+    }
+  }
 
   var iss_idx = 0
-  var iss_cnt = 0
+  var int_iss_cnt = 0
+  var mem_iss_cnt = 0
   for (w <- 0 until exe_units.length) {
     var fu_types = exe_units(w).io.fu_types
     val exe_unit = exe_units(w)
@@ -745,14 +744,15 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
       }
 
       if (exe_unit.hasMem) {
-        iss_valids(iss_idx) := issue_units.mem_iq.io.iss_valids(0)
-        iss_uops(iss_idx)   := issue_units.mem_iq.io.iss_uops(0)
-        issue_units.mem_iq.io.fu_types(0) := fu_types
+        iss_valids(iss_idx) := mem_iss_unit.io.iss_valids(mem_iss_cnt)
+        iss_uops(iss_idx)   := mem_iss_unit.io.iss_uops(mem_iss_cnt)
+        mem_iss_unit.io.fu_types(mem_iss_cnt) := fu_types
+        mem_iss_cnt += 1
       } else {
-        iss_valids(iss_idx) := issue_units.int_iq.io.iss_valids(iss_cnt)
-        iss_uops(iss_idx)   := issue_units.int_iq.io.iss_uops(iss_cnt)
-        issue_units.int_iq.io.fu_types(iss_cnt) := fu_types
-        iss_cnt += 1
+        iss_valids(iss_idx) := int_iss_unit.io.iss_valids(int_iss_cnt)
+        iss_uops(iss_idx)   := int_iss_unit.io.iss_uops(int_iss_cnt)
+        int_iss_unit.io.fu_types(int_iss_cnt) := fu_types
+        int_iss_cnt += 1
       }
       iss_idx += 1
     }
@@ -764,38 +764,12 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   issue_units.map(_.io.flush_pipeline := rob.io.flush.valid)
 
   // Load-hit Misspeculations
-  require (issue_units.count(_.iqType == IQT_MEM.litValue) == 1 || usingUnifiedMemIntIQs)
-  val mem_iq = issue_units.mem_iq
+  require (mem_iss_unit.issueWidth <= 2)
+  issue_units.map(_.io.ld_miss := io.lsu.ld_miss)
 
-  require (mem_iq.issueWidth == 1)
-  val iss_loadIssued =
-    mem_iq.io.iss_valids(0) &&
-    mem_iq.io.iss_uops(0).is_load &&
-    !mem_iq.io.iss_uops(0).fp_val &&
-    mem_iq.io.iss_uops(0).pdst =/= 0.U &&
-    !(sxt_ldMiss && (mem_iq.io.iss_uops(0).iw_p1_poisoned || mem_iq.io.iss_uops(0).iw_p2_poisoned))
-  sxt_ldMiss :=
-    ((lsu.io.nack.valid && lsu.io.nack.isload) || dc_shim.io.core.load_miss) &&
-    Pipe(true.B, iss_loadIssued, 4).bits
-  issue_units.map(_.io.sxt_ldMiss := sxt_ldMiss)
-
-  // Check that IF we see a speculative load-wakeup and NO load-miss, then we should
-  // see a writeback to the register file!
-
-  // Share the memory port with other long latency operations.
-  val mem_unit = exe_units.memory_unit
-  val mem_resp = mem_unit.io.ll_iresp
-  mem_unit.io.com_exception := rob.io.flush.valid
-
-  when (RegNext(!sxt_ldMiss) && RegNext(RegNext(lsu.io.mem_ldSpecWakeup.valid)) &&
-        !(RegNext(rob.io.flush.valid || (br_unit.brinfo.valid && br_unit.brinfo.mispredict))) &&
-        !(RegNext(RegNext(rob.io.flush.valid || (br_unit.brinfo.valid && br_unit.brinfo.mispredict))))) {
-    assert (mem_resp.valid && mem_resp.bits.uop.ctrl.rf_wen && mem_resp.bits.uop.dst_rtype === RT_FIX,
-      "[core] We did not see a RF writeback for a speculative load that claimed no load-miss.")
-  }
+  mem_units.map(u => u.io.com_exception := rob.io.flush.valid)
 
   // Wakeup (Issue & Writeback)
-
   for {
     iu <- issue_units
     (issport, wakeup) <- iu.io.wakeup_ports zip int_iss_wakeups
@@ -818,7 +792,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
 
   for (w <- 0 until exe_units.numIrfReaders) {
     iregister_read.io.iss_valids(w) :=
-      iss_valids(w) && !(sxt_ldMiss && (iss_uops(w).iw_p1_poisoned || iss_uops(w).iw_p2_poisoned))
+      iss_valids(w) && !(io.lsu.ld_miss && (iss_uops(w).iw_p1_poisoned || iss_uops(w).iw_p2_poisoned))
   }
   iregister_read.io.iss_uops := iss_uops
   iregister_read.io.iss_uops map { u => u.iw_p1_poisoned := false.B; u.iw_p2_poisoned := false.B }
@@ -886,6 +860,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   // reading requires serializing the entire pipeline
   csr.io.fcsr_flags.valid := rob.io.commit.fflags.valid
   csr.io.fcsr_flags.bits  := rob.io.commit.fflags.bits
+  csr.io.set_fs_dirty.get := rob.io.commit.fflags.valid
 
   exe_units.withFilter(_.hasFcsr).map(_.io.fcsr_rm := csr.io.fcsr_rm)
   io.fcsr_rm := csr.io.fcsr_rm
@@ -935,39 +910,30 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   //-------------------------------------------------------------
 
   // enqueue basic load/store info in Decode
-  lsu.io.dec_uops := dec_uops
-
   for (w <- 0 until coreWidth) {
-    // Decoding instructions request load/store queue entries when they can proceed.
-    lsu.io.dec_ld_vals(w) := dec_will_fire(w) && dec_uops(w).is_load
-    lsu.io.dec_st_vals(w) := dec_will_fire(w) && dec_uops(w).is_store
-
-    lsu.io.dec_uops(w).rob_idx := dec_uops(w).rob_idx // for debug purposes (commit logging)
+    io.lsu.dis_uops(w).valid := dis_fire(w)
+    io.lsu.dis_uops(w).bits  := dis_uops(w)
   }
 
-  lsu.io.commit_store_mask := rob.io.commit.st_mask
-  lsu.io.commit_load_mask  := rob.io.commit.ld_mask
-  lsu.io.commit_load_at_rob_head := rob.io.com_load_is_at_rob_head
+  // tell LSU about committing loads and stores to clear entries
+  io.lsu.commit                  := rob.io.commit
+
+  // tell LSU that it should fire a load that waits for the rob to clear
+  io.lsu.commit_load_at_rob_head := rob.io.com_load_is_at_rob_head
 
   //com_xcpt.valid comes too early, will fight against a branch that resolves same cycle as an exception
-  lsu.io.exception := rob.io.flush.valid
+  io.lsu.exception := rob.io.flush.valid
 
   // Handle Branch Mispeculations
-  lsu.io.brinfo := br_unit.brinfo
-  dc_shim.io.core.brinfo := br_unit.brinfo
+  io.lsu.brinfo := br_unit.brinfo
+  io.lsu.rob_head_idx := rob.io.rob_head_idx
+  io.lsu.rob_pnr_idx  := rob.io.rob_pnr_idx
 
-  lsu.io.debug_tsc := debug_tsc_reg
+  io.lsu.tsc_reg := debug_tsc_reg
 
-  dc_shim.io.core.flush_pipe := rob.io.flush.valid
-
-  lsu.io.nack <> dc_shim.io.core.nack
-
-  lsu.io.dmem_req_ready := dc_shim.io.core.req.ready
-  lsu.io.dmem_is_ordered:= dc_shim.io.core.ordered
-  lsu.io.release := io.release
 
   if (usingFPU) {
-    lsu.io.fp_stdata <> fp_pipeline.io.to_sdq
+    io.lsu.fp_stdata <> fp_pipeline.io.to_sdq
   }
 
   //-------------------------------------------------------------
@@ -977,8 +943,14 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   //-------------------------------------------------------------
 
   var w_cnt = 1
-  // 0th goes to ll_wbarb
-  iregfile.io.write_ports(0) := WritePort(ll_wbarb.io.out, IPREG_SZ, xLen)
+  iregfile.io.write_ports(0) := WritePort(ll_wbarb.io.out, ipregSz, xLen, RT_FIX)
+  ll_wbarb.io.in(0) <> mem_resps(0)
+  assert (ll_wbarb.io.in(0).ready) // never backpressure the memory unit.
+  for (i <- 1 until memWidth) {
+    iregfile.io.write_ports(w_cnt) := WritePort(mem_resps(i), ipregSz, xLen, RT_FIX)
+    w_cnt += 1
+  }
+
   for (i <- 0 until exe_units.length) {
     if (exe_units(i).writesIrf) {
       val wbresp = exe_units(i).io.iresp
@@ -986,7 +958,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
       val wbdata = wbresp.bits.data
 
       def wbIsValid(rtype: UInt) =
-        wbresp.valid && wbresp.bits.uop.ctrl.rf_wen && wbresp.bits.uop.dst_rtype === rtype
+        wbresp.valid && wbresp.bits.uop.rf_wen && wbresp.bits.uop.dst_rtype === rtype
       val wbReadsCSR = wbresp.bits.uop.ctrl.csr_cmd =/= freechips.rocketchip.rocket.CSR.N
 
       iregfile.io.write_ports(w_cnt).valid     := wbIsValid(RT_FIX)
@@ -1001,28 +973,27 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
       assert (!wbIsValid(RT_FLT), "[fppipeline] An FP writeback is being attempted to the Int Regfile.")
 
       assert (!(wbresp.valid &&
-        !wbresp.bits.uop.ctrl.rf_wen &&
+        !wbresp.bits.uop.rf_wen &&
         wbresp.bits.uop.dst_rtype === RT_FIX),
         "[fppipeline] An Int writeback is being attempted with rf_wen disabled.")
 
       assert (!(wbresp.valid &&
-        wbresp.bits.uop.ctrl.rf_wen &&
+        wbresp.bits.uop.rf_wen &&
         wbresp.bits.uop.dst_rtype =/= RT_FIX),
         "[fppipeline] writeback being attempted to Int RF with dst != Int type exe_units("+i+").iresp")
       w_cnt += 1
     }
   }
   require(w_cnt == iregfile.io.write_ports.length)
-  ll_wbarb.io.in(0) <> mem_resp
-  assert (ll_wbarb.io.in(0).ready) // never backpressure the memory unit.
+
 
   if (usingFPU) {
     // Connect IFPU
-    fp_pipeline.io.from_int <> exe_units.ifpu_unit.io.ll_fresp
+    fp_pipeline.io.from_int  <> exe_units.ifpu_unit.io.ll_fresp
     // Connect FPIU
-    ll_wbarb.io.in(1)       <> fp_pipeline.io.to_int
+    ll_wbarb.io.in(1)        <> fp_pipeline.io.to_int
     // Connect FLDs
-    fp_pipeline.io.ll_wport <> exe_units.memory_unit.io.ll_fresp
+    fp_pipeline.io.ll_wports <> exe_units.memory_units.map(_.io.ll_fresp)
   }
   if (usingRoCC) {
     require(usingFPU)
@@ -1035,26 +1006,23 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   //-------------------------------------------------------------
   //-------------------------------------------------------------
 
-  // Dispatch
-  rob.io.enq_valids := rename_stage.io.ren1_mask
-  rob.io.enq_uops   := rename_stage.io.ren1_uops
-  rob.io.enq_new_packet := dec_finished_mask === 0.U
-  rob.io.enq_partial_stall := dec_last_inst_was_stalled // TODO come up with better ROB compacting scheme.
-  rob.io.debug_tsc := debug_tsc_reg
-  rob.io.csr_stall := csr.io.csr_stall
-
-  assert ((dec_will_fire zip rename_stage.io.ren1_mask map {case(d,r) => d === r}).reduce(_|_),
-    "[core] Assumption that dec_will_fire and ren1_mask are equal is being violated.")
-
   // Writeback
   // ---------
   // First connect the ll_wport
   val ll_uop = ll_wbarb.io.out.bits.uop
-  rob.io.wb_resps(0).valid  := ll_wbarb.io.out.valid && !(ll_uop.is_store && !ll_uop.is_amo)
+  rob.io.wb_resps(0).valid  := ll_wbarb.io.out.valid && !(ll_uop.uses_stq && !ll_uop.is_amo)
   rob.io.wb_resps(0).bits   <> ll_wbarb.io.out.bits
   rob.io.debug_wb_valids(0) := ll_wbarb.io.out.valid && ll_uop.dst_rtype =/= RT_X
   rob.io.debug_wb_wdata(0)  := ll_wbarb.io.out.bits.data
   var cnt = 1
+  for (i <- 1 until memWidth) {
+    val mem_uop = mem_resps(i).bits.uop
+    rob.io.wb_resps(cnt).valid := mem_resps(i).valid && !(mem_uop.uses_stq && !mem_uop.is_amo)
+    rob.io.wb_resps(cnt).bits  := mem_resps(i).bits
+    rob.io.debug_wb_valids(cnt) := mem_resps(i).valid && mem_uop.dst_rtype =/= RT_X
+    rob.io.debug_wb_wdata(cnt)  := mem_resps(i).bits.data
+    cnt += 1
+  }
   var f_cnt = 0 // rob fflags port index
   for (eu <- exe_units) {
     if (eu.writesIrf)
@@ -1063,9 +1031,9 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
       val wb_uop = resp.bits.uop
       val data   = resp.bits.data
 
-      rob.io.wb_resps(cnt).valid := resp.valid && !(wb_uop.is_store && !wb_uop.is_amo)
+      rob.io.wb_resps(cnt).valid := resp.valid && !(wb_uop.uses_stq && !wb_uop.is_amo)
       rob.io.wb_resps(cnt).bits  <> resp.bits
-      rob.io.debug_wb_valids(cnt) := resp.valid && wb_uop.ctrl.rf_wen && wb_uop.dst_rtype === RT_FIX
+      rob.io.debug_wb_valids(cnt) := resp.valid && wb_uop.rf_wen && wb_uop.dst_rtype === RT_FIX
       if (eu.hasFFlags) {
         rob.io.fflags(f_cnt) <> resp.bits.fflags
         f_cnt += 1
@@ -1081,7 +1049,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
     }
   }
 
-  require(cnt == numIrfWritePorts + 1)
+  require(cnt == numIrfWritePorts)
   if (usingFPU) {
     for ((wdata, wakeup) <- fp_pipeline.io.debug_wb_wdata zip fp_pipeline.io.wakeups) {
       rob.io.wb_resps(cnt) <> wakeup
@@ -1105,20 +1073,18 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   // branch resolution
   rob.io.brinfo <> br_unit.brinfo
 
-  // branch unit requests PCs and predictions from ROB during register read
-  // (fetch PC from ROB cycle earlier than needed for critical path reasons)
-  io.ifu.get_pc.ftq_idx := RegNext(iss_uops(brunit_idx).ftq_idx)
-  exe_units(brunit_idx).io.get_ftq_pc.fetch_pc       := RegNext(io.ifu.get_pc.fetch_pc)
-  exe_units(brunit_idx).io.get_ftq_pc.next_val       := RegNext(io.ifu.get_pc.next_val)
-  exe_units(brunit_idx).io.get_ftq_pc.next_pc        := RegNext(io.ifu.get_pc.next_pc)
   exe_units(brunit_idx).io.status := csr.io.status
 
+  // Connect breakpoint info to memaddrcalcunit
+  for (i <- 0 until memWidth) {
+    mem_units(i).io.status := csr.io.status
+    mem_units(i).io.bp     := csr.io.bp
+  }
+
   // LSU <> ROB
-  rob.io.lsu_clr_bsy_valid      := lsu.io.clr_bsy_valid
-  rob.io.lsu_clr_bsy_rob_idx    := lsu.io.clr_bsy_rob_idx
-  rob.io.lsu_clr_unsafe_valid   := lsu.io.clr_unsafe_valid
-  rob.io.lsu_clr_unsafe_rob_idx := lsu.io.clr_unsafe_rob_idx
-  rob.io.lxcpt <> lsu.io.xcpt
+  rob.io.lsu_clr_bsy    := io.lsu.clr_bsy
+  rob.io.lsu_clr_unsafe := io.lsu.clr_unsafe
+  rob.io.lxcpt          <> io.lsu.lxcpt
 
   assert (!(csr.io.singleStep), "[core] single-step is unsupported.")
 
@@ -1171,7 +1137,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
 
     val numFtqWhitespace = if (DEBUG_PRINTF_FTQ) (ftqSz/4)+1 else 0
     val fetchWhitespace = if (fetchWidth >= 8) 2 else 0
-    var whitespace = (debugScreenheight - 25 + 3 -10 + 3 + 4 - coreWidth - (NUM_LDQ_ENTRIES max NUM_STQ_ENTRIES) -
+    var whitespace = (debugScreenheight - 25 + 3 -10 + 3 + 4 - coreWidth - (numLdqEntries max numStqEntries) -
       issueParams.map(_.numEntries).sum - issueParams.length - (numRobEntries/coreWidth) -
       numFtqWhitespace - fetchWhitespace)
 
@@ -1185,9 +1151,9 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
     for (w <- 0 until coreWidth) {
       printf("    Slot:%d (PC:0x%x Valids:%c%c Inst:DASM(%x))\n",
         w.U,
-        dec_uops(w).pc(19,0),
+        dec_uops(w).debug_pc(19,0),
         BoolToChar(io.ifu.fetchpacket.valid && dec_fbundle.uops(w).valid && !dec_finished_mask(w), 'V'),
-        BoolToChar(dec_will_fire(w), 'V'),
+        BoolToChar(dec_fire(w), 'V'),
         dec_fbundle.uops(w).bits.debug_inst)
     }
 
@@ -1195,7 +1161,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
     for (w <- 0 until coreWidth) {
       printf("    Slot:%d (PC:0x%x Valid:%c Inst:DASM(%x))\n",
         w.U,
-        rename_stage.io.ren2_uops(w).pc(19,0),
+        rename_stage.io.ren2_uops(w).debug_pc(19,0),
         BoolToChar(rename_stage.io.ren2_mask(w), 'V'),
         rename_stage.io.ren2_uops(w).debug_inst)
     }
@@ -1216,19 +1182,19 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
           Mux(ren_uop.dst_rtype === RT_X  , Str("-"),
             Mux(ren_uop.dst_rtype === RT_FLT, Str("f"),
               Mux(ren_uop.dst_rtype === RT_PAS, Str("C"), Str("?"))))),
-        ren_uop.pop1,
+        ren_uop.prs1,
         BoolToChar(rename_stage.io.ren2_uops(w).prs1_busy, 'B', 'R'),
         Mux(ren_uop.lrs1_rtype    === RT_FIX, Str("X"),
           Mux(ren_uop.lrs1_rtype === RT_X  , Str("-"),
             Mux(ren_uop.lrs1_rtype === RT_FLT, Str("f"),
               Mux(ren_uop.lrs1_rtype === RT_PAS, Str("C"), Str("?"))))),
-        ren_uop.pop2,
+        ren_uop.prs2,
         BoolToChar(rename_stage.io.ren2_uops(w).prs2_busy, 'B', 'R'),
         Mux(ren_uop.lrs2_rtype    === RT_FIX, Str("X"),
           Mux(ren_uop.lrs2_rtype === RT_X  , Str("-"),
             Mux(ren_uop.lrs2_rtype === RT_FLT, Str("f"),
               Mux(ren_uop.lrs2_rtype === RT_PAS, Str("C"), Str("?"))))),
-        ren_uop.pop3,
+        ren_uop.prs3,
         BoolToChar(rename_stage.io.ren2_uops(w).prs3_busy, 'B', 'R'),
         BoolToChar(ren_uop.frs3_en, 'f', '-'))
     }
@@ -1236,16 +1202,15 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
     if (DEBUG_PRINTF_ROB) {
       val robTypeStrs = RobTypeToChars(rob.io.debug.state)
       printf("ROB:\n")
-      printf("    (State:%c%c%c Rdy:%c LAQFull:%c STQFull:%c Flush:%c BMskFull:%c DShimRdy:%c) BMsk:0x%x Mode:%c\n",
+      printf("    (State:%c%c%c Rdy:%c LAQFull:%c STQFull:%c Flush:%c BMskFull:%c) BMsk:0x%x Mode:%c\n",
          robTypeStrs(0),
          robTypeStrs(1),
          robTypeStrs(2),
          BoolToChar(           rob.io.ready, '_', '!'),
-         BoolToChar(          lsu.io.laq_full(0), 'L'),
-         BoolToChar(          lsu.io.stq_full(0), 'S'),
+         BoolToChar(          io.lsu.ldq_full(0), 'L'),
+         BoolToChar(          io.lsu.stq_full(0), 'S'),
          BoolToChar(          rob.io.flush.valid, 'F'),
          BoolToChar(branch_mask_full.reduce(_|_), 'B'),
-         BoolToChar(   dc_shim.io.core.req.ready, 'R', 'B'),
          dec_brmask_logic.io.debug.branch_mask,
          Mux(csr.io.status.prv === (PRV.M).U, Str("M"),
            Mux(csr.io.status.prv === (PRV.U).U, Str("U"),
@@ -1257,15 +1222,17 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
       BoolToChar(rob.io.com_xcpt.valid, 'E'),
       rob.io.com_xcpt.bits.cause,
       rob.io.commit.valids.asUInt,
-      rename_stage.io.debug.ifreelist,
-      PopCount(rename_stage.io.debug.ifreelist),
-      rename_stage.io.debug.iisprlist,
-      PopCount(rename_stage.io.debug.iisprlist))
-    printf("    FFreeList:0x%x TotFree:%d FPrefLst:0x%x TotPreg:%d\n",
-      rename_stage.io.debug.ffreelist,
-      PopCount(rename_stage.io.debug.ffreelist),
-      rename_stage.io.debug.fisprlist,
-      PopCount(rename_stage.io.debug.fisprlist))
+      rename_stage.io.debug.freelist,
+      PopCount(rename_stage.io.debug.freelist),
+      rename_stage.io.debug.isprlist,
+      PopCount(rename_stage.io.debug.isprlist))
+    if (usingFPU) {
+      printf("    FFreeList:0x%x TotFree:%d FPrefLst:0x%x TotPreg:%d\n",
+        fp_rename_stage.io.debug.freelist,
+        PopCount(fp_rename_stage.io.debug.freelist),
+        fp_rename_stage.io.debug.isprlist,
+        PopCount(fp_rename_stage.io.debug.isprlist))
+    }
 
     // branch unit
     printf("Branch Unit:\n")
@@ -1285,7 +1252,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   if (COMMIT_LOG_PRINTF) {
     var new_commit_cnt = 0.U
     for (w <- 0 until coreWidth) {
-      val priv = csr.io.status.prv
+      val priv = RegNext(csr.io.status.prv) // erets change the privilege. Get the old one
 
       // To allow for diffs against spike :/
       def printf_inst(uop: MicroOp) = {
@@ -1299,7 +1266,7 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
       when (rob.io.commit.valids(w)) {
         printf("%d 0x%x ",
           priv,
-          Sext(rob.io.commit.uops(w).pc(vaddrBits-1,0), xLen))
+          Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
         printf_inst(rob.io.commit.uops(w))
         when (rob.io.commit.uops(w).dst_rtype === RT_FIX && rob.io.commit.uops(w).ldst =/= 0.U) {
           printf(" x%d 0x%x\n",
@@ -1313,6 +1280,67 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
           printf("\n")
         }
       }
+    }
+  }
+
+  // enable Dromajo cosimulation
+  if (DROMAJO_COSIM_ENABLE) {
+    // currently only supports single-core systems
+    require(p(BoomTilesKey).size == 1)
+
+    tileParams.asInstanceOf[BoomTileParams].dromajoParams match {
+      case Some(params) => {
+        val bootromParams = params.bootromParams.get
+        val extMemParams = params.extMemParams.get
+        val plicParams = params.plicParams.get
+        val clintParams = params.clintParams.get
+
+        val resetVectorStr = "0x" + f"${bootromParams.hang}%X"
+        val bootromFile = Paths.get(bootromParams.contentFileName).toAbsolutePath.toString
+        val mmioStart = "0x" + f"${bootromParams.address + bootromParams.size}%X"
+        val mmioEnd = "0x" + f"${extMemParams.master.base}%X"
+        val plicBase = "0x" + f"${plicParams.baseAddress}%X"
+        val plicSize = "0x" + f"${PLICConsts.size(plicParams.maxHarts)}%X"
+        val clintBase = "0x" + f"${clintParams.baseAddress}%X"
+        val clintSize = "0x" + f"${CLINTConsts.size}%X"
+        val memSize = "0x" + f"${extMemParams.master.size}%X"
+
+        // instantiate dromajo cosim bbox
+        val dromajo = Module(new DromajoCosimBlackBox(
+          coreWidth,
+          xLen,
+          bootromFile,
+          resetVectorStr,
+          mmioStart,
+          mmioEnd,
+          plicBase,
+          plicSize,
+          clintBase,
+          clintSize,
+          memSize))
+
+        def getInst(uop: MicroOp): UInt = {
+          Mux(uop.is_rvc, Cat(0.U(16.W), uop.debug_inst(15,0)), uop.debug_inst)
+        }
+
+        def getWdata(uop: MicroOp): UInt = {
+          Mux((uop.dst_rtype === RT_FIX && uop.ldst =/= 0.U) || (uop.dst_rtype === RT_FLT), uop.debug_wdata, 0.U(xLen.W))
+        }
+
+        dromajo.io.clock := clock
+        dromajo.io.reset := reset
+        dromajo.io.valid := rob.io.commit.valids.asUInt
+        dromajo.io.hartid := io.hartid
+        dromajo.io.pc     := Cat(rob.io.commit.uops.reverse.map(uop => Sext(uop.debug_pc(vaddrBits-1,0), xLen)))
+        dromajo.io.inst   := Cat(rob.io.commit.uops.reverse.map(uop => getInst(uop)))
+        dromajo.io.wdata  := Cat(rob.io.commit.uops.reverse.map(uop => getWdata(uop)))
+        dromajo.io.mstatus := 0.U // Currently not used in Dromajo
+        dromajo.io.check   := ((1 << coreWidth) - 1).U
+        dromajo.io.int_xcpt := rob.io.com_xcpt.valid
+        dromajo.io.cause    := rob.io.com_xcpt.bits.cause
+      }
+
+      case None => throw new java.lang.Exception("Error: No BootROMParams found in BoomTile parameters")
     }
   }
 
@@ -1348,14 +1376,14 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
         printf("%d; O3PipeView:decode:%d\n", dec_uops(w).debug_events.fetch_seq, debug_tsc_reg)
       }
       // Rename begins when uop leaves fetch buffer (Dec+Ren1 are in same stage).
-      when (dec_will_fire(w)) {
+      when (dec_fire(w)) {
         printf("%d; O3PipeView:rename: %d\n", dec_uops(w).debug_events.fetch_seq, debug_tsc_reg)
       }
       when (dispatcher.io.ren_uops(w).valid) {
         printf("%d; O3PipeView:dispatch: %d\n", dispatcher.io.ren_uops(w).bits.debug_events.fetch_seq, debug_tsc_reg)
       }
 
-      when (dec_rdy || io.ifu.clear_fetchbuffer) {
+      when (dec_ready || flush_ifu) {
         dec_printed_mask := 0.U
       } .otherwise {
         dec_printed_mask := dec_valids.asUInt | dec_printed_mask
@@ -1375,7 +1403,6 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   //-------------------------------------------------------------
   // Page Table Walker
 
-  io.ptw_tlb <> lsu.io.ptw
   io.ptw.ptbr       := csr.io.ptbr
   io.ptw.status     := csr.io.status
   io.ptw.pmp        := csr.io.pmp
@@ -1385,34 +1412,33 @@ class BoomCore(implicit p: Parameters, edge: freechips.rocketchip.tilelink.TLEdg
   //-------------------------------------------------------------
 
   io.rocc := DontCare
+  io.rocc.exception := csr.io.exception && csr.io.status.xs.orR
   if (usingRoCC) {
     exe_units.rocc_unit.io.rocc.rocc         <> io.rocc
-    exe_units.rocc_unit.io.rocc.dec_uops     := dec_uops
+    exe_units.rocc_unit.io.rocc.dis_uops     := dis_uops
     exe_units.rocc_unit.io.rocc.rob_head_idx := rob.io.rob_head_idx
     exe_units.rocc_unit.io.rocc.rob_pnr_idx  := rob.io.rob_pnr_idx
-    exe_units.rocc_unit.io.com_exception     := rob.io.com_xcpt.valid
+    exe_units.rocc_unit.io.com_exception     := rob.io.flush.valid
     exe_units.rocc_unit.io.status            := csr.io.status
 
     for (w <- 0 until coreWidth) {
-       exe_units.rocc_unit.io.rocc.dec_rocc_vals(w) := (
-         dec_will_fire(w) &&
-         rename_stage.io.inst_can_proceed(w) &&
-         !rob.io.flush.valid &&
-         dec_uops(w).uopc === uopROCC)
+       exe_units.rocc_unit.io.rocc.dis_rocc_vals(w) := (
+         dis_fire(w) &&
+         dis_uops(w).uopc === uopROCC)
     }
   }
 
-  //io.trace := csr.io.trace unused
   if (p(BoomTilesKey)(0).trace) {
     for (w <- 0 until coreWidth) {
       io.trace(w).valid      := rob.io.commit.valids(w)
-      io.trace(w).iaddr      := Sext(rob.io.commit.uops(w).pc(vaddrBits-1,0), xLen)
+      io.trace(w).iaddr      := Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen)
       io.trace(w).insn       := rob.io.commit.uops(w).debug_inst
-      // I'm uncertain the commit signals from the ROB match these CSR exception signals
+      // These csr signals do not exactly match up with the ROB commit signals.
       io.trace(w).priv       := csr.io.status.prv
-      io.trace(w).exception  := csr.io.exception
-      io.trace(w).interrupt  := csr.io.interrupt
-      io.trace(w).cause      := csr.io.cause
+      // Can determine if it is an interrupt or not based on the MSB of the cause
+      io.trace(w).exception  := rob.io.com_xcpt.valid && !rob.io.com_xcpt.bits.cause(xLen - 1)
+      io.trace(w).interrupt  := rob.io.com_xcpt.valid && rob.io.com_xcpt.bits.cause(xLen - 1)
+      io.trace(w).cause      := rob.io.com_xcpt.bits.cause
       io.trace(w).tval       := csr.io.tval
     }
     dontTouch(io.trace)

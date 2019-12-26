@@ -2,8 +2,6 @@
 // Copyright (c) 2015 - 2018, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -13,13 +11,14 @@
 
 package boom.exu
 
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.{ArrayBuffer}
 
 import chisel3._
 
-import freechips.rocketchip.config.Parameters
+import freechips.rocketchip.config.{Parameters}
 
 import boom.common._
+import boom.util.{BoomCoreStringPrefix}
 
 /**
  * Top level class to wrap all execution units together into a "collection"
@@ -66,9 +65,8 @@ class ExecutionUnits(val fpu: Boolean)(implicit val p: Parameters) extends HasBo
     exe_units.count(f)
   }
 
-  lazy val memory_unit = {
-    require (exe_units.count(_.hasMem) == 1) // only one mem_unit supported
-    exe_units.find(_.hasMem).get
+  lazy val memory_units = {
+    exe_units.filter(_.hasMem)
   }
 
   lazy val br_unit = {
@@ -111,16 +109,15 @@ class ExecutionUnits(val fpu: Boolean)(implicit val p: Parameters) extends HasBo
   if (!fpu) {
     val int_width = issueParams.find(_.iqType == IQT_INT.litValue).get.issueWidth
 
-    if (!usingUnifiedMemIntIQs) {
+    for (w <- 0 until memWidth) {
       val memExeUnit = Module(new ALUExeUnit(
         hasAlu = false,
         hasMem = true))
 
-        memExeUnit.io.ll_iresp.ready := DontCare
+      memExeUnit.io.ll_iresp.ready := DontCare
 
-        exe_units += memExeUnit
+      exe_units += memExeUnit
     }
-
 
     for (w <- 0 until int_width) {
       def is_nth(n: Int): Boolean = w == ((n) % int_width)
@@ -130,8 +127,7 @@ class ExecutionUnits(val fpu: Boolean)(implicit val p: Parameters) extends HasBo
         hasRocc        = is_nth(1) && usingRoCC,
         hasMul         = is_nth(2),
         hasDiv         = is_nth(3),
-        hasIfpu        = is_nth(4) && usingFPU,
-        hasMem         = usingUnifiedMemIntIQs))
+        hasIfpu        = is_nth(4) && usingFPU))
       exe_units += alu_exe_unit
     }
   } else {
@@ -145,16 +141,20 @@ class ExecutionUnits(val fpu: Boolean)(implicit val p: Parameters) extends HasBo
   }
 
   val exeUnitsStr = new StringBuilder
-  if (!fpu) {
-    exeUnitsStr.append(
-      ( "\n   [Core " + hartId + "] ==" + Seq("One","Two","Three","Four")(coreWidth-1) + "-wide Machine=="
-      + "\n   [Core " + hartId + "] ==" + Seq("Single","Dual","Triple","Quad","Five","Six")(totalIssueWidth-1) + " Issue==\n"))
-  }
-
   for (exe_unit <- exe_units) {
     exeUnitsStr.append(exe_unit.toString)
   }
-  override def toString: String =  exeUnitsStr.toString
+
+  override def toString: String =
+    (BoomCoreStringPrefix("===ExecutionUnits===") + "\n"
+    + (if (!fpu) {
+      BoomCoreStringPrefix(
+        "==" + coreWidth + "-wide Machine==",
+        "==" + totalIssueWidth + " Issue==")
+    } else {
+      ""
+    }) + "\n"
+    + exeUnitsStr.toString)
 
   require (exe_units.length != 0)
   if (!fpu) {

@@ -2,8 +2,6 @@
 // Copyright (c) 2015 - 2018, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -39,12 +37,13 @@ import freechips.rocketchip.util._
 
 import boom.common._
 import boom.exu._
+import boom.util.{BoomCoreStringPrefix}
 
 //------------------------------------------------------------------------------
 // DenseBTB
 //------------------------------------------------------------------------------
 
-class DenseBTB(implicit p: Parameters) extends BoomBTB
+class DenseBTB(val bankBytes: Int)(implicit p: Parameters) extends BoomBTB
 {
   private val lsbSz = log2Ceil(coreInstBytes)
   private val bankBit = log2Ceil(fetchWidth*coreInstBytes)
@@ -66,7 +65,7 @@ class DenseBTB(implicit p: Parameters) extends BoomBTB
     val tag      = UInt(tagSz.W)
     val offset   = UInt(offsetSz.W)
     val bpd_type = BpredType()
-    val cfi_type = CfiType()
+    val cfi_type = UInt(CFI_SZ.W)
     val cfi_idx  = UInt(log2Ceil(fetchWidth).W)
   }
 
@@ -156,7 +155,7 @@ class DenseBTB(implicit p: Parameters) extends BoomBTB
 
   // bim
 
-  val bim = Module(new BimodalTable())
+  val bim = Module(new BimodalTable(bankBytes))
   bim.io.req := io.req
   bim.io.do_reset := false.B // TODO
   bim.io.flush := false.B // TODO
@@ -381,14 +380,13 @@ class DenseBTB(implicit p: Parameters) extends BoomBTB
       bim.io.resp.bits.rowdata)
   }
 
-  override def toString: String =
-    "   [Core " + hartId + "] ==Dense BTB==" +
-    "\n   [Core " + hartId + "] Sets          : " + nSets +
-    "\n   [Core " + hartId + "] Banks         : " + nBanks +
-    "\n   [Core " + hartId + "] Ways          : " + nWays +
-    "\n   [Core " + hartId + "] Branch Levels : " + branchLevels +
-    "\n   [Core " + hartId + "] Tag Size      : " + tagSz +
-    "\n   [Core " + hartId + "] Offset Size   : " + offsetSz +
-    "\n\n" +
+  override def toString: String = BoomCoreStringPrefix(
+    "==Dense BTB==",
+    "Sets          : " + nSets,
+    "Banks         : " + nBanks,
+    "Ways          : " + nWays,
+    "Branch Levels : " + branchLevels,
+    "Tag Size      : " + tagSz,
+    "Offset Size   : " + offsetSz) + "\n" +
     bim.toString
 }

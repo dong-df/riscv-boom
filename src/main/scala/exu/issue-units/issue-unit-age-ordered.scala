@@ -2,8 +2,6 @@
 // Copyright (c) 2015 - 2018, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -65,7 +63,7 @@ class IssueUnitCollapsing(
                                                         !dis_uops(i).is_fence &&
                                                         !dis_uops(i).is_fencei)
 
-  val uops = issue_slots.map(s=>s.updated_uop) ++ dis_uops.map(s=>s)
+  val uops = issue_slots.map(s=>s.out_uop) ++ dis_uops.map(s=>s)
   for (i <- 0 until numIssueSlots) {
     issue_slots(i).in_uop.valid := false.B
     issue_slots(i).in_uop.bits  := uops(i+1)
@@ -76,8 +74,8 @@ class IssueUnitCollapsing(
       }
     }
     issue_slots(i).wakeup_ports := io.wakeup_ports
-    issue_slots(i).ldspec_dst   := io.mem_ldSpecWakeup
-    issue_slots(i).ldspec_miss  := io.sxt_ldMiss
+    issue_slots(i).ldspec_dst   := io.spec_ld_wakeup
+    issue_slots(i).ldspec_miss  := io.ld_miss
     issue_slots(i).brinfo       := io.brinfo
     issue_slots(i).kill         := io.flush_pipeline
     issue_slots(i).clear        := shamts_oh(i) =/= 0.U
@@ -102,9 +100,9 @@ class IssueUnitCollapsing(
     io.iss_valids(w) := false.B
     io.iss_uops(w)   := NullMicroOp
     // unsure if this is overkill
-    io.iss_uops(w).pop1 := 0.U
-    io.iss_uops(w).pop2 := 0.U
-    io.iss_uops(w).pop3 := 0.U
+    io.iss_uops(w).prs1 := 0.U
+    io.iss_uops(w).prs2 := 0.U
+    io.iss_uops(w).prs3 := 0.U
     io.iss_uops(w).lrs1_rtype := RT_X
     io.iss_uops(w).lrs2_rtype := RT_X
   }

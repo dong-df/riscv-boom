@@ -2,8 +2,6 @@
 // Copyright (c) 2015 - 2019, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -31,7 +29,7 @@ import freechips.rocketchip.config.{Parameters}
 
 import boom.common._
 import boom.exu._
-import boom.util.{BoolToChar}
+import boom.util.{BoolToChar, BoomCoreStringPrefix}
 
 case class BimParameters(
   nSets: Int = 1024, // how many sets (conceptually) should we have?
@@ -116,7 +114,7 @@ class BimWrite(implicit p: Parameters) extends BimBundle
   val mask = UInt(rowSz.W)
 }
 
-class BimodalTable(implicit p: Parameters) extends BoomModule with HasBimParameters
+class BimodalTable(val bankBytes: Int)(implicit p: Parameters) extends BoomModule with HasBimParameters
 {
   val io = IO(new Bundle {
     // req.valid is false if stalling (aka, we won't read and use BTB results, on cycle S1).
@@ -134,7 +132,7 @@ class BimodalTable(implicit p: Parameters) extends BoomModule with HasBimParamet
   })
 
   // Which (conceptual) index do we map to?
-  private def getIdx (addr: UInt): UInt = addr >> log2Ceil(fetchWidth*coreInstBytes)
+  private def getIdx (addr: UInt): UInt = addr >> log2Ceil(bankBytes)
   // Which physical row do we map to?
   private def getRowFromIdx (idx: UInt): UInt = idx >> log2Ceil(nBanks)
   // Which physical bank do we map to?
@@ -219,7 +217,7 @@ class BimodalTable(implicit p: Parameters) extends BoomModule with HasBimParamet
 
   for (w <- 0 until nBanks) {
     val ram = SyncReadMem(nSets/nBanks, Vec(rowSz, Bool()))
-    ram.suggestName("bim_data_array")
+    ram.suggestName(s"bim_data_array_$w")
 
     val ren = Wire(Bool())
     val s2_rmw_valid = Wire(Bool())
@@ -345,8 +343,7 @@ class BimodalTable(implicit p: Parameters) extends BoomModule with HasBimParamet
   // Trust me, I just work.
 
   val size_kbits = nSets * fetchWidth * 2/1024 // assumes 2 bits / fetchWidth
-  override def toString: String =
-    "   [Core " + hartId + "] ==BIM==" +
-    "\n   [Core " + hartId + "] (" + size_kbits + " Kbits = " + size_kbits/8 + " kB) Bimodal Table (" +
-    nSets + " entries across " + nBanks + " banks)"
+  override def toString: String = BoomCoreStringPrefix(
+    "==BIM==",
+    "(" + size_kbits + " Kbits = " + size_kbits/8 + " kB) Bimodal Table (" + nSets + " entries across " + nBanks + " banks)")
 }

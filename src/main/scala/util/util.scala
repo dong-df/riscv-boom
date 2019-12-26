@@ -2,8 +2,6 @@
 // Copyright (c) 2015 - 2019, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -19,6 +17,8 @@ import chisel3.util._
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.util.{Str}
+import freechips.rocketchip.config.{Parameters}
+import freechips.rocketchip.tile.{TileKey}
 
 import boom.common.{MicroOp}
 import boom.exu.{BrResolutionInfo}
@@ -72,7 +72,7 @@ object IsKilledByBranch
 object GetNewUopAndBrMask
 {
   def apply(uop: MicroOp, brinfo: BrResolutionInfo)
-    (implicit p: freechips.rocketchip.config.Parameters): MicroOp = {
+    (implicit p: Parameters): MicroOp = {
     val newuop = WireInit(uop)
     newuop.br_mask := Mux(brinfo.valid,
                           (uop.br_mask & ~brinfo.mask),
@@ -97,6 +97,26 @@ object GetNewBrMask
                 (br_mask & ~brinfo.mask),
                 br_mask)
    }
+}
+
+object UpdateBrMask
+{
+  def apply(brinfo: BrResolutionInfo, uop: MicroOp): MicroOp = {
+    val out = WireInit(uop)
+    out.br_mask := GetNewBrMask(brinfo, uop)
+    out
+  }
+  def apply[T <: boom.common.HasBoomUOP](brinfo: BrResolutionInfo, bundle: T): T = {
+    val out = WireInit(bundle)
+    out.uop.br_mask := GetNewBrMask(brinfo, bundle.uop.br_mask)
+    out
+  }
+  def apply[T <: boom.common.HasBoomUOP](brinfo: BrResolutionInfo, bundle: Valid[T]): Valid[T] = {
+    val out = WireInit(bundle)
+    out.bits.uop.br_mask := GetNewBrMask(brinfo, bundle.bits.uop.br_mask)
+    out.valid := bundle.valid && !IsKilledByBranch(brinfo, bundle.bits.uop.br_mask)
+    out
+  }
 }
 
 /**
@@ -346,10 +366,6 @@ object AgePriorityEncoder
 /**
   * Object to determine whether queue
   * index i0 is older than index i1.
-  *
-  * is i0 older than i1? (closest to zero). Provide the tail_ptr to the
-  *  queue. This is Cat(i1 <= tail, i1) because the rob_tail can point to a
-  * valid (partially dispatched) row.
  */
 object IsOlder
 {
@@ -357,28 +373,88 @@ object IsOlder
 }
 
 /**
-  * Object to determine whether queue
-  * index i0 is older than index i1.
-  *
-  * is i0 older than i1? (closest to zero). Provide the tail_ptr to the
-  *  queue. This is Cat(i1 <= tail, i1) because the rob_tail can point to a
-  * valid (partially dispatched) row.
+ * Set all bits at or below the highest order '1'.
  */
 object MaskLower
 {
-  def apply(in: UInt) = (0 until in.getWidth).map(i => in >> i.U).reduce(_|_)
+  def apply(in: UInt) = {
+    val n = in.getWidth
+    (0 until n).map(i => in >> i.U).reduce(_|_)
+  }
 }
 
+/**
+ * Set all bits at or above the lowest order '1'.
+ */
 object MaskUpper
 {
-  def apply(in: UInt) = (0 until in.getWidth).map(i => in << i.U).reduce(_|_)
+  def apply(in: UInt) = {
+    val n = in.getWidth
+    (0 until n).map(i => (in << i.U)(n-1,0)).reduce(_|_)
+  }
+}
+
+/**
+ * Transpose a matrix of Chisel Vecs.
+ */
+object Transpose
+{
+  def apply[T <: chisel3.core.Data](in: Vec[Vec[T]]) = {
+    val n = in(0).size
+    VecInit((0 until n).map(i => VecInit(in.map(row => row(i)))))
+  }
+}
+
+/**
+  * N-wide one-hot priority encoder.
+ */
+object SelectFirstN
+{
+  def apply(in: UInt, n: Int) = {
+    val sels = Wire(Vec(n, UInt(in.getWidth.W)))
+    var mask = in
+
+    for (i <- 0 until n) {
+      sels(i) := PriorityEncoderOH(mask)
+      mask = mask & ~sels(i)
+    }
+
+    sels
+  }
+}
+
+/**
+ * Connect the first k of n valid input interfaces to k output interfaces.
+ */
+class Compactor[T <: chisel3.core.Data](n: Int, k: Int, gen: T) extends Module
+{
+  require(n >= k)
+
+  val io = IO(new Bundle {
+    val in  = Vec(n, Flipped(DecoupledIO(gen)))
+    val out = Vec(k,         DecoupledIO(gen))
+  })
+
+  if (n == k) {
+    io.out <> io.in
+  } else {
+    val counts = io.in.map(_.valid).scanLeft(1.U(k.W)) ((c,e) => Mux(e, (c<<1)(k-1,0), c))
+    val sels = Transpose(VecInit(counts map (c => VecInit(c.asBools)))) map (col =>
+                 (col zip io.in.map(_.valid)) map {case (c,v) => c && v})
+    val in_readys = counts map (row => (row.asBools zip io.out.map(_.ready)) map {case (c,r) => c && r} reduce (_||_))
+    val out_valids = sels map (col => col.reduce(_||_))
+    val out_data = sels map (s => Mux1H(s, io.in.map(_.bits)))
+
+    in_readys zip io.in foreach {case (r,i) => i.ready := r}
+    out_valids zip out_data zip io.out foreach {case ((v,d),o) => o.valid := v; o.bits := d}
+  }
 }
 
 /**
  * Create a queue that can be killed with a branch kill signal.
  * Assumption: enq.valid only high if not killed by branch (so don't check IsKilled on io.enq).
  */
-class BranchKillableQueue[T <: boom.common.HasBoomUOP](gen: T, entries: Int)
+class BranchKillableQueue[T <: boom.common.HasBoomUOP](gen: T, entries: Int, flush_fn: boom.common.MicroOp => Bool = u => true.B, flow: Boolean = true)
   (implicit p: freechips.rocketchip.config.Parameters)
   extends boom.common.BoomModule()(p)
   with boom.common.HasBoomCoreParameters
@@ -394,38 +470,39 @@ class BranchKillableQueue[T <: boom.common.HasBoomUOP](gen: T, entries: Int)
     val count   = Output(UInt(log2Ceil(entries).W))
   })
 
-  private val ram     = Mem(entries, gen)
-  private val valids  = RegInit(VecInit(Seq.fill(entries) {false.B}))
-  private val brmasks = Reg(Vec(entries, UInt(MAX_BR_COUNT.W)))
+  val ram     = Mem(entries, gen)
+  val valids  = RegInit(VecInit(Seq.fill(entries) {false.B}))
+  val uops    = Reg(Vec(entries, new MicroOp))
 
-  private val enq_ptr = Counter(entries)
-  private val deq_ptr = Counter(entries)
-  private val maybe_full = RegInit(false.B)
+  val enq_ptr = Counter(entries)
+  val deq_ptr = Counter(entries)
+  val maybe_full = RegInit(false.B)
 
-  private val ptr_match = enq_ptr.value === deq_ptr.value
+  val ptr_match = enq_ptr.value === deq_ptr.value
   io.empty := ptr_match && !maybe_full
-  private val full = ptr_match && maybe_full
-  private val do_enq = WireInit(io.enq.fire())
-
-  private val deq_ram_valid = WireInit(!(io.empty))
-  private val do_deq = WireInit(io.deq.ready && deq_ram_valid)
+  val full = ptr_match && maybe_full
+  val do_enq = WireInit(io.enq.fire())
+  val do_deq = WireInit((io.deq.ready || !valids(deq_ptr.value)) && !io.empty)
 
   for (i <- 0 until entries) {
-    val mask = brmasks(i)
-    valids(i)  := valids(i) && !IsKilledByBranch(io.brinfo, mask) && !io.flush
+    val mask = uops(i).br_mask
+    val uop  = uops(i)
+    valids(i)  := valids(i) && !IsKilledByBranch(io.brinfo, mask) && !(io.flush && flush_fn(uop))
     when (valids(i)) {
-      brmasks(i) := GetNewBrMask(io.brinfo, mask)
+      uops(i).br_mask := GetNewBrMask(io.brinfo, mask)
     }
   }
 
   when (do_enq) {
-    ram(enq_ptr.value) := io.enq.bits
-    valids(enq_ptr.value) := true.B //!IsKilledByBranch(io.brinfo, io.enq.bits.uop)
-    brmasks(enq_ptr.value) := GetNewBrMask(io.brinfo, io.enq.bits.uop)
+    ram(enq_ptr.value)          := io.enq.bits
+    valids(enq_ptr.value)       := true.B //!IsKilledByBranch(io.brinfo, io.enq.bits.uop)
+    uops(enq_ptr.value)         := io.enq.bits.uop
+    uops(enq_ptr.value).br_mask := GetNewBrMask(io.brinfo, io.enq.bits.uop)
     enq_ptr.inc()
   }
 
   when (do_deq) {
+    valids(deq_ptr.value) := false.B
     deq_ptr.inc()
   }
 
@@ -435,21 +512,24 @@ class BranchKillableQueue[T <: boom.common.HasBoomUOP](gen: T, entries: Int)
 
   io.enq.ready := !full
 
-  private val out = ram(deq_ptr.value)
-  io.deq.valid := deq_ram_valid && valids(deq_ptr.value) && !IsKilledByBranch(io.brinfo, out.uop)
-  io.deq.bits := out
-  io.deq.bits.uop.br_mask := GetNewBrMask(io.brinfo, brmasks(deq_ptr.value))
+  val out = Wire(gen)
+  out             := ram(deq_ptr.value)
+  out.uop         := uops(deq_ptr.value)
+  io.deq.valid            := !io.empty && valids(deq_ptr.value) && !IsKilledByBranch(io.brinfo, out.uop)
+  io.deq.bits             := out
+  io.deq.bits.uop.br_mask := GetNewBrMask(io.brinfo, out.uop)
 
   // For flow queue behavior.
-  when (io.empty) {
-    io.deq.valid := io.enq.valid //&& !IsKilledByBranch(io.brinfo, io.enq.bits.uop)
-    io.deq.bits := io.enq.bits
-    io.deq.bits.uop.br_mask := GetNewBrMask(io.brinfo, io.enq.bits.uop)
+  if (flow) {
+    when (io.empty) {
+      io.deq.valid := io.enq.valid //&& !IsKilledByBranch(io.brinfo, io.enq.bits.uop)
+      io.deq.bits := io.enq.bits
+      io.deq.bits.uop.br_mask := GetNewBrMask(io.brinfo, io.enq.bits.uop)
 
-    do_deq := false.B
-    when (io.deq.ready) { do_enq := false.B }
+      do_deq := false.B
+      when (io.deq.ready) { do_enq := false.B }
+    }
   }
-
   private val ptr_diff = enq_ptr.value - deq_ptr.value
   if (isPow2(entries)) {
     io.count := Cat(maybe_full && ptr_match, ptr_diff)
@@ -569,5 +649,19 @@ object FPRegToChars
                       " ft8", " ft9", "ft10", "ft11")
     val multiVec = VecInit(for(string <- strings) yield { VecInit(for (c <- string) yield { Str(c) }) })
     multiVec(fpreg)
+  }
+}
+
+object BoomCoreStringPrefix
+{
+  /**
+  * Add prefix to BOOM strings (currently only adds the hartId)
+  *
+  * @param strs list of strings
+  * @return String combining the list with the prefix per line
+  */
+  def apply(strs: String*)(implicit p: Parameters) = {
+    val prefix = "[C" + s"${p(TileKey).hartId}" + "] "
+    strs.map(str => prefix + str + "\n").mkString("")
   }
 }

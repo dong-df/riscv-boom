@@ -2,8 +2,6 @@
 // Copyright (c) 2013 - 2018, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -21,6 +19,7 @@ import chisel3.util._
 import freechips.rocketchip.config.Parameters
 
 import boom.common._
+import boom.util.{BoomCoreStringPrefix}
 
 /**
  * IO bundle for a register read port
@@ -51,11 +50,11 @@ class RegisterFileWritePort(val addrWidth: Int, val dataWidth: Int)(implicit p: 
  */
 object WritePort
 {
-  def apply(enq: DecoupledIO[ExeUnitResp], addrWidth: Int, dataWidth: Int)
+  def apply(enq: DecoupledIO[ExeUnitResp], addrWidth: Int, dataWidth: Int, rtype: UInt)
     (implicit p: Parameters): Valid[RegisterFileWritePort] = {
      val wport = Wire(Valid(new RegisterFileWritePort(addrWidth, dataWidth)))
 
-     wport.valid     := enq.valid
+     wport.valid     := enq.valid && enq.bits.uop.dst_rtype === rtype
      wport.bits.addr := enq.bits.uop.pdst
      wport.bits.data := enq.bits.data
      enq.ready       := true.B
@@ -81,18 +80,18 @@ abstract class RegisterFile(
   (implicit p: Parameters) extends BoomModule
 {
   val io = IO(new BoomBundle {
-    val read_ports = Vec(numReadPorts, new RegisterFileReadPortIO(PREG_SZ, registerWidth))
-    val write_ports = Flipped(Vec(numWritePorts, Valid(new RegisterFileWritePort(PREG_SZ, registerWidth))))
+    val read_ports = Vec(numReadPorts, new RegisterFileReadPortIO(maxPregSz, registerWidth))
+    val write_ports = Flipped(Vec(numWritePorts, Valid(new RegisterFileWritePort(maxPregSz, registerWidth))))
   })
 
   private val rf_cost = (numReadPorts + numWritePorts) * (numReadPorts + 2*numWritePorts)
   private val type_str = if (registerWidth == fLen+1) "Floating Point" else "Integer"
-  override def toString: String =
-    "\n   [Core " + hartId + "] ==" + type_str + " Regfile==" +
-    "\n   [Core " + hartId + "] Num RF Read Ports     : " + numReadPorts +
-    "\n   [Core " + hartId + "] Num RF Write Ports    : " + numWritePorts +
-    "\n   [Core " + hartId + "] RF Cost (R+W)*(R+2W)  : " + rf_cost +
-    "\n   [Core " + hartId + "] Bypassable Units      : " + bypassableArray
+  override def toString: String = BoomCoreStringPrefix(
+    "==" + type_str + " Regfile==",
+    "Num RF Read Ports     : " + numReadPorts,
+    "Num RF Write Ports    : " + numWritePorts,
+    "RF Cost (R+W)*(R+2W)  : " + rf_cost,
+    "Bypassable Units      : " + bypassableArray)
 }
 
 /**

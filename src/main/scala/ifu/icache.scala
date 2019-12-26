@@ -2,8 +2,6 @@
 // Copyright (c) 2017 - 2019, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -16,7 +14,6 @@ package boom.ifu
 import chisel3._
 import chisel3.util._
 import chisel3.internal.sourceinfo.{SourceInfo}
-import chisel3.experimental.{dontTouch}
 import chisel3.experimental.{chiselName}
 
 import freechips.rocketchip.config.{Parameters}
@@ -27,8 +24,12 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property._
 import freechips.rocketchip.rocket.{HasL1ICacheParameters, ICacheParams, ICacheErrors, ICacheReq}
+import freechips.rocketchip.diplomaticobjectmodel.logicaltree.{LogicalTreeNode}
+import freechips.rocketchip.diplomaticobjectmodel.DiplomaticObjectModelAddressing
+import freechips.rocketchip.diplomaticobjectmodel.model.{OMComponent, OMICache, OMECC}
 
 import boom.common._
+import boom.util.{BoomCoreStringPrefix}
 
 /**
  * ICache module
@@ -60,7 +61,7 @@ class ICache(
       Seq(TLManagerParameters(
         address         = Seq(AddressSet(itimAddr, size-1)),
         resources       = device.reg("mem"),
-        regionType      = RegionType.UNCACHEABLE,
+        regionType      = RegionType.IDEMPOTENT,
         executable      = true,
         supportsPutFull = TransferSizes(1, wordBytes),
         supportsPutPartial = TransferSizes(1, wordBytes),
@@ -68,6 +69,26 @@ class ICache(
         fifoId          = Some(0))), // requests handled in FIFO order
       beatBytes = wordBytes,
       minLatency = 1)})
+}
+class BoomICacheLogicalTreeNode(icache: ICache, deviceOpt: Option[SimpleDevice], params: ICacheParams) extends LogicalTreeNode(() => deviceOpt) {
+  override def getOMComponents(resourceBindings: ResourceBindings, children: Seq[OMComponent] = Nil): Seq[OMComponent] = {
+    Seq(
+      OMICache(
+        memoryRegions = DiplomaticObjectModelAddressing.getOMMemoryRegions("ITIM", resourceBindings),
+        interrupts = Nil,
+        nSets = params.nSets,
+        nWays = params.nWays,
+        blockSizeBytes = params.blockBytes,
+        dataMemorySizeBytes = params.nSets * params.nWays * params.blockBytes,
+        dataECC = params.dataECC.map(OMECC.fromString),
+        tagECC = params.tagECC.map(OMECC.fromString),
+        nTLBEntries = params.nTLBEntries,
+        maxTimSize = params.nSets * (params.nWays-1) * params.blockBytes,
+        memories = if(!icache.enableBlackBox) icache.module.asInstanceOf[ICacheModule].dataArrays.map(_._2)
+                   else Seq()
+      )
+    )
+  }
 }
 
 /**
@@ -214,7 +235,7 @@ class ICacheModule(outer: ICache) extends ICacheBaseModule(outer)
     0.U
   } else {
     // pick a way that is not used by the scratchpad
-    val v0 = LFSR16(refill_fire)(log2Ceil(nWays)-1,0)
+    val v0 = random.LFSR(16, refill_fire)(log2Ceil(nWays)-1,0)
     var v = v0
     for (i <- log2Ceil(nWays) - 1 to 0 by -1) {
       val mask = nWays - (BigInt(1) << (i + 1))
@@ -280,15 +301,37 @@ class ICacheModule(outer: ICache) extends ICacheBaseModule(outer)
     if (2*tl_out.d.bits.data.getWidth == wordBits) (nSets * refillCycles/2)
     else (nSets * refillCycles)
 
+  val dataArrays = if(cacheParams.fetchBytes <= 8)
+      // Use unbanked icache for narrow accesses.
+      (0 until nWays).map { x =>
+        DescribedSRAM(
+          name = s"dataArrayWay_${x}",
+          desc = "ICache Data Array",
+          size = nSets * refillCycles,
+          data = UInt(dECC.width(wordBits).W)
+        )
+      }
+    else
+      // Use two banks, interleaved.
+      (0 until nWays).map { x =>
+        DescribedSRAM(
+          name = s"dataArrayB0Way_${x}",
+          desc = "ICache Data Array",
+          size = nSets * refillCycles,
+          data = UInt(dECC.width(wordBits/nBanks).W)
+        )} ++
+      (0 until nWays).map { x =>
+        DescribedSRAM(
+          name = s"dataArrayB1Way_${x}",
+          desc = "ICache Data Array",
+          size = nSets * refillCycles,
+          data = UInt(dECC.width(wordBits/nBanks).W)
+        )}
+
   if (cacheParams.fetchBytes <= 8) {
     // Use unbanked icache for narrow accesses.
-    val dataArrays = (0 until nWays).map { x =>
-       SyncReadMem(nSets * refillCycles, UInt(dECC.width(wordBits).W)).suggestName(
-          "dataArrayWay_" + x.toString)
-    }
-
     s1_bankId := 0.U
-    for ((dataArray, i) <- dataArrays zipWithIndex) {
+    for ((dataArray, i) <- dataArrays.map(_._1) zipWithIndex) {
       def row(addr: UInt) = addr(untagBits-1, blockOffBits-log2Ceil(refillCycles))
       val s0_ren = s0_valid || s0_slaveValid
 
@@ -306,13 +349,9 @@ class ICacheModule(outer: ICache) extends ICacheBaseModule(outer)
       s1_dout(i) := dataArray.read(mem_idx, !wen && s0_ren)
     }
   } else {
-    val dataArraysB0 = (0 until nWays).map { x =>
-      SyncReadMem(ramDepth, UInt(dECC.width(wordBits/nBanks).W)).suggestName(
-        "dataArrayB0Way_" + x.toString)}
-    val dataArraysB1 = (0 until nWays).map { x =>
-      SyncReadMem(ramDepth, UInt(dECC.width(wordBits/nBanks).W)).suggestName(
-        "dataArrayB1Way_" + x.toString)}
     // Use two banks, interleaved.
+    val dataArraysB0 = dataArrays.map(_._1).take(nWays)
+    val dataArraysB1 = dataArrays.map(_._1).drop(nWays)
     require (nBanks == 2)
 
     // Bank0 row's id wraps around if Bank1 is the starting bank.
@@ -630,18 +669,18 @@ class ICacheModule(outer: ICache) extends ICacheBaseModule(outer)
   cover(error_cross_covers)
 
   val ramWidth = dECC.width(wordBits/nBanks)
-  override def toString: String =
-    "\n   [Core " + hartId + "] ==L1-ICache==" +
-    "\n   [Core " + hartId + "] Fetch bytes   : " + cacheParams.fetchBytes +
-    "\n   [Core " + hartId + "] Block bytes   : " + (1 << blockOffBits) +
-    "\n   [Core " + hartId + "] Row bytes     : " + rowBytes +
-    "\n   [Core " + hartId + "] Word bits     : " + wordBits +
-    "\n   [Core " + hartId + "] Sets          : " + nSets +
-    "\n   [Core " + hartId + "] Ways          : " + nWays +
-    "\n   [Core " + hartId + "] Refill cycles : " + refillCycles +
-    "\n   [Core " + hartId + "] RAMs          : (" +  ramWidth + " x " + nSets*refillCycles + ") using " + nBanks + " banks"  +
-    "\n   [Core " + hartId + "] " + (if (nBanks == 2) "Dual-banked" else "Single-banked") +
-    "\n   [Core " + hartId + "] I-TLB entries : " + cacheParams.nTLBEntries + "\n"
+  override def toString: String = BoomCoreStringPrefix(
+    "==L1-ICache==",
+    "Fetch bytes   : " + cacheParams.fetchBytes,
+    "Block bytes   : " + (1 << blockOffBits),
+    "Row bytes     : " + rowBytes,
+    "Word bits     : " + wordBits,
+    "Sets          : " + nSets,
+    "Ways          : " + nWays,
+    "Refill cycles : " + refillCycles,
+    "RAMs          : (" +  ramWidth + " x " + nSets*refillCycles + ") using " + nBanks + " banks",
+    "" + (if (nBanks == 2) "Dual-banked" else "Single-banked"),
+    "I-TLB entries : " + cacheParams.nTLBEntries + "\n")
 }
 
 /**

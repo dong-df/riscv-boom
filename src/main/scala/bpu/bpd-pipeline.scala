@@ -2,8 +2,6 @@
 // Copyright (c) 2017 - 2019, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -32,7 +30,7 @@ import freechips.rocketchip.util.{Str, UIntToAugmentedUInt}
 
 import boom.common._
 import boom.exu.{BranchUnitResp}
-import boom.util.{BoolToChar}
+import boom.util.{BoolToChar, BoomCoreStringPrefix}
 
 /**
  * Give this to each instruction/uop and pass this down the pipeline to the branch unit
@@ -55,7 +53,7 @@ class BranchPredInfo(implicit p: Parameters) extends BoomBundle
 /**
  * Wraps the BoomBTB and BrPredictor into a pipeline that is parallel with the Fetch pipeline.
  */
-class BranchPredictionStage(implicit p: Parameters) extends BoomModule
+class BranchPredictionStage(val bankBytes: Int)(implicit p: Parameters) extends BoomModule
 {
   val io = IO(new BoomBundle {
     // Fetch0
@@ -70,6 +68,7 @@ class BranchPredictionStage(implicit p: Parameters) extends BoomModule
     val f2_stall      = Input(Bool()) // f3 is not ready -- back-pressure the f2 stage.
     val f2_replay     = Input(Bool()) // I$ is replaying S2 PC into S0 again (S2 backed up or failed).
     val f2_redirect   = Input(Bool()) // I$ is being redirected from F2.
+    val f2_aligned_pc = Input(UInt(vaddrBitsExtended.W))
 
     // Fetch3
     val f3_is_br      = Input(Vec(fetchWidth, Bool())) // mask of branches from I$
@@ -77,6 +76,7 @@ class BranchPredictionStage(implicit p: Parameters) extends BoomModule
     val f3_btb_update = Flipped(Valid(new BoomBTBUpdate))
     val f3_ras_update = Flipped(Valid(new RasUpdate))
     val f3_stall      = Input(Bool()) // f4 is not ready -- back-pressure the f3 stage.
+    val f3_will_redirect = Input(Bool())
 
     // Fetch4
     val f4_redirect   = Input(Bool()) // I$ is being redirected from F4.
@@ -99,7 +99,7 @@ class BranchPredictionStage(implicit p: Parameters) extends BoomModule
   //************************************************
   // construct all of the modules
 
-  val btb = BoomBTB(boomParams)
+  val btb = BoomBTB(boomParams, bankBytes)
   val bpd = BoomBrPredictor(boomParams)
 
   btb.io.status_debug := io.status_debug
@@ -134,19 +134,21 @@ class BranchPredictionStage(implicit p: Parameters) extends BoomModule
 
   //************************************************
   // Update the RAS
-  // TODO XXX  reenable RAS
 
   // update RAS based on BTB's prediction information (or the branch-check correction).
-  //val jmp_idx = f2_btb.bits.cfi_idx
+  val jmp_idx = btb.io.resp.bits.cfi_idx
 
   btb.io.ras_update := io.f3_ras_update
-  btb.io.ras_update.valid := false.B // TODO XXX renable RAS (f2_btb.valid || io.f3_ras_update.valid) &&
-                                     // !io.fetch_stalled
-  //when (f2_btb.valid) {
-  //   btb.io.ras_update.bits.is_call      := BpredType.isCall(f2_btb.bits.bpd_type)
-  //   btb.io.ras_update.bits.is_ret       := BpredType.isReturn(f2_btb.bits.bpd_type)
-  //   btb.io.ras_update.bits.return_addr  := f2_aligned_pc + (jmp_idx << 2.U) + 4.U
-  //}
+  btb.io.ras_update.valid := (btb.io.resp.valid && !io.f2_stall && !io.f3_will_redirect ||
+                             io.f3_ras_update.valid && !io.f3_stall) && !io.f4_redirect
+                               // TODO Have a mechanism to decrease the prevalence of misspeculated RAS updates.
+                               // Perhaps the RAS belongs under the jurisdiction of the branch-checker.
+  when (btb.io.resp.valid) {
+     btb.io.ras_update.bits.is_call     := BpredType.isCall(btb.io.resp.bits.bpd_type)
+     btb.io.ras_update.bits.is_ret      := BpredType.isReturn(btb.io.resp.bits.bpd_type)
+     btb.io.ras_update.bits.return_addr := io.f2_aligned_pc + (jmp_idx << (log2Ceil(coreInstBytes)).U) +
+                                             Mux(btb.io.resp.bits.is_rvc || btb.io.resp.bits.is_edge, 2.U, 4.U)
+  }
 
   //************************************************
   // Update the BTB/BIM
@@ -210,5 +212,8 @@ class BranchPredictionStage(implicit p: Parameters) extends BoomModule
     assert (!(io.f2_btb_resp.valid), "[bpd-pipeline] BTB predicted, but it's been disabled.")
   }
 
-  override def toString: String = btb.toString + "\n\n" + bpd.toString
+  override def toString: String =
+    (BoomCoreStringPrefix("===BPD Pipeline===") + "\n"
+    + btb.toString + "\n"
+    + bpd.toString)
 }

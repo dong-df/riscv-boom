@@ -2,8 +2,6 @@
 // Copyright (c) 2016 - 2019, The Regents of the University of California (Regents).
 // All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
 //------------------------------------------------------------------------------
-// Author: Christopher Celio
-//------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
@@ -34,7 +32,7 @@ import freechips.rocketchip.config.{Parameters, Field}
 import freechips.rocketchip.util.Str
 
 import boom.common._
-import boom.util.{ElasticReg, Fold}
+import boom.util.{ElasticReg, Fold, BoomCoreStringPrefix}
 
 /**
  * TAGE parameters used in configurations
@@ -190,9 +188,12 @@ class TageBrPredictor(
     mask_oh
   }
 
-  private def IdxHash(addr: UInt, hist: UInt, hlen: Int, idx_sz: Int): UInt = {
-    val idx = Cat(Fold(hist, idx_sz, hlen), addr(4)) ^ (addr >> 5)
-    idx
+  private def IdxHash(addr: UInt, hist: UInt, hlen: Int, idxSz: Int): UInt = {
+    val pc = addr >> log2Ceil(coreInstBytes).U
+    val n = idxSz
+    val k = log2Ceil(fetchWidth)
+    val idx = Fold(hist, idxSz, hlen) ^ (pc >> k.U) ^ pc(k-1,0)
+    idx(idxSz-1,0)
   }
 
   private def TagHash(addr: UInt, a: UInt, b: UInt): UInt = {
@@ -477,9 +478,9 @@ class TageBrPredictor(
     assert (r_info.provider_id < numTables.U || !r_info.provider_hit, "[Tage] provider_id is out-of-bounds.")
   }
 
-  override def toString: String =
-    "   [Core " + hartId + "] ==TAGE BPU==" +
-    "\n   [Core " + hartId + "] " + (sizeInBits/8/1024.0) + " kB TAGE Predictor (" +
+  override def toString: String = BoomCoreStringPrefix(
+    "==TAGE BPU==",
+    "" + (sizeInBits/8/1024.0) + " kB TAGE Predictor (" +
     (sizeInBits/1024) + " Kbits) (max history length: " + historyLengths.max + " bits)\n" +
-    tables.mkString("\n")
+    tables.mkString(""))
 }
