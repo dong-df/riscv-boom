@@ -17,7 +17,7 @@ import freechips.rocketchip.util._
 import freechips.rocketchip.rocket._
 
 import boom.common._
-import boom.exu.BrResolutionInfo
+import boom.exu.BrUpdateInfo
 import boom.util.{IsKilledByBranch, GetNewBrMask, BranchKillableQueue, IsOlder, UpdateBrMask, AgePriorityEncoder, WrapInc, Transpose}
 
 
@@ -79,7 +79,7 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
 
   when (state === s_invalid) {
     io.req.ready := true.B
-    when (io.req.fire()) {
+    when (io.req.fire) {
       state := s_fill_buffer
       data_req_cnt := 0.U
       req := io.req.bits
@@ -100,7 +100,7 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
     r1_data_req_cnt   := 0.U
     r2_data_req_fired := r1_data_req_fired
     r2_data_req_cnt   := r1_data_req_cnt
-    when (io.data_req.fire() && io.meta_read.fire()) {
+    when (io.data_req.fire && io.meta_read.fire) {
       r1_data_req_fired := true.B
       r1_data_req_cnt   := data_req_cnt
       data_req_cnt := data_req_cnt + 1.U
@@ -116,7 +116,7 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
   } .elsewhen (state === s_lsu_release) {
     io.lsu_release.valid := true.B
     io.lsu_release.bits := probeResponse
-    when (io.lsu_release.fire()) {
+    when (io.lsu_release.fire) {
      state := s_active
     }
   } .elsewhen (state === s_active) {
@@ -126,10 +126,10 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
     when (io.mem_grant) {
       acked := true.B
     }
-    when (io.release.fire()) {
+    when (io.release.fire) {
       data_req_cnt := data_req_cnt + 1.U
     }
-    when ((data_req_cnt === (refillCycles-1).U) && io.release.fire()) {
+    when ((data_req_cnt === (refillCycles-1).U) && io.release.fire) {
       state := Mux(req.voluntary, s_grant, s_invalid)
     }
   } .elsewhen (state === s_grant) {
@@ -155,6 +155,8 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
     val mshr_wb_rdy = Output(Bool()) // Should we block MSHR writebacks while we finish our own?
     val block_state = Input(new ClientMetadata())
     val lsu_release = Decoupled(new TLBundleC(edge.bundle))
+
+    val state = Output(Valid(UInt(coreMaxAddrBits.W)))
   }
 
   val (s_invalid :: s_meta_read :: s_meta_resp :: s_mshr_req ::
@@ -172,6 +174,9 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
   val miss_coh = ClientMetadata.onReset
   val reply_coh = Mux(tag_matches, old_coh, miss_coh)
   val (is_dirty, report_param, new_coh) = reply_coh.onProbe(req.param)
+
+  io.state.valid := state =/= s_invalid
+  io.state.bits  := req.address
 
   io.req.ready := state === s_invalid
   io.rep.valid := state === s_release
@@ -206,12 +211,12 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
 
   // state === s_invalid
   when (state === s_invalid) {
-    when (io.req.fire()) {
+    when (io.req.fire) {
       state := s_meta_read
       req := io.req.bits
     }
   } .elsewhen (state === s_meta_read) {
-    when (io.meta_read.fire()) {
+    when (io.meta_read.fire) {
       state := s_meta_resp
     }
   } .elsewhen (state === s_meta_resp) {
@@ -225,7 +230,7 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
   } .elsewhen (state === s_mshr_resp) {
     state := Mux(tag_matches && is_dirty, s_writeback_req, s_lsu_release)
   } .elsewhen (state === s_lsu_release) {
-    when (io.lsu_release.fire()) {
+    when (io.lsu_release.fire) {
       state := s_release
     }
   } .elsewhen (state === s_release) {
@@ -233,7 +238,7 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
       state := Mux(tag_matches, s_meta_write, s_invalid)
     }
   } .elsewhen (state === s_writeback_req) {
-    when (io.wb_req.fire()) {
+    when (io.wb_req.fire) {
       state := s_writeback_resp
     }
   } .elsewhen (state === s_writeback_resp) {
@@ -242,7 +247,7 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
       state := s_meta_write
     }
   } .elsewhen (state === s_meta_write) {
-    when (io.meta_write.fire()) {
+    when (io.meta_write.fire) {
       state := s_meta_write_resp
     }
   } .elsewhen (state === s_meta_write_resp) {
@@ -254,12 +259,12 @@ class BoomL1MetaReadReq(implicit p: Parameters) extends BoomBundle()(p) {
   val req = Vec(memWidth, new L1MetaReadReq)
 }
 
- class BoomL1DataReadReq(implicit p: Parameters) extends BoomBundle()(p) {
+class BoomL1DataReadReq(implicit p: Parameters) extends BoomBundle()(p) {
   val req = Vec(memWidth, new L1DataReadReq)
   val valid = Vec(memWidth, Bool())
 }
 
-class BoomDataArray(implicit p: Parameters) extends BoomModule with HasL1HellaCacheParameters {
+abstract class AbstractBoomDataArray(implicit p: Parameters) extends BoomModule with HasL1HellaCacheParameters {
   val io = IO(new BoomBundle {
     val read  = Input(Vec(memWidth, Valid(new L1DataReadReq)))
     val write = Input(Valid(new L1DataWriteReq))
@@ -268,6 +273,34 @@ class BoomDataArray(implicit p: Parameters) extends BoomModule with HasL1HellaCa
   })
 
   def pipeMap[T <: Data](f: Int => T) = VecInit((0 until memWidth).map(f))
+
+}
+
+class BoomDuplicatedDataArray(implicit p: Parameters) extends AbstractBoomDataArray
+{
+
+  val waddr = io.write.bits.addr >> rowOffBits
+  for (j <- 0 until memWidth) {
+
+    val raddr = io.read(j).bits.addr >> rowOffBits
+    for (w <- 0 until nWays) {
+      val (array, omSRAM) = DescribedSRAM(
+        name = s"array_${w}_${j}",
+        desc = "Non-blocking DCache Data Array",
+        size = nSets * refillCycles,
+        data = Vec(rowWords, Bits(encDataBits.W))
+      )
+      when (io.write.bits.way_en(w) && io.write.valid) {
+        val data = VecInit((0 until rowWords) map (i => io.write.bits.data(encDataBits*(i+1)-1,encDataBits*i)))
+        array.write(waddr, data, io.write.bits.wmask.asBools)
+      }
+      io.resp(j)(w) := RegNext(array.read(raddr, io.read(j).bits.way_en(w) && io.read(j).valid).asUInt)
+    }
+    io.nacks(j) := false.B
+  }
+}
+
+class BoomBankedDataArray(implicit p: Parameters) extends AbstractBoomDataArray {
 
   val nBanks   = boomParams.numDCacheBanks
   val bankSize = nSets * refillCycles / nBanks
@@ -343,24 +376,25 @@ class BoomDataArray(implicit p: Parameters) extends BoomModule with HasL1HellaCa
  *
  * @param hartid hardware thread for the cache
  */
-class BoomNonBlockingDCache(hartid: Int)(implicit p: Parameters) extends LazyModule
+class BoomNonBlockingDCache(staticIdForMetadataUseOnly: Int)(implicit p: Parameters) extends LazyModule
 {
   private val tileParams = p(TileKey)
   protected val cfg = tileParams.dcache.get
 
-  protected def cacheClientParameters = cfg.scratch.map(x => Seq()).getOrElse(Seq(TLClientParameters(
-    name          = s"Core ${hartid} DCache",
+  protected def cacheClientParameters = cfg.scratch.map(x => Seq()).getOrElse(Seq(TLMasterParameters.v1(
+    name          = s"Core ${staticIdForMetadataUseOnly} DCache",
     sourceId      = IdRange(0, 1 max (cfg.nMSHRs + 1)),
     supportsProbe = TransferSizes(cfg.blockBytes, cfg.blockBytes))))
 
-  protected def mmioClientParameters = Seq(TLClientParameters(
-    name          = s"Core ${hartid} DCache MMIO",
+  protected def mmioClientParameters = Seq(TLMasterParameters.v1(
+    name          = s"Core ${staticIdForMetadataUseOnly} DCache MMIO",
     sourceId      = IdRange(cfg.nMSHRs + 1, cfg.nMSHRs + 1 + cfg.nMMIOs),
     requestFifo   = true))
 
-  val node = TLClientNode(Seq(TLClientPortParameters(
+  val node = TLClientNode(Seq(TLMasterPortParameters.v1(
     cacheClientParameters ++ mmioClientParameters,
     minLatency = 1)))
+
 
   lazy val module = new BoomNonBlockingDCacheModule(this)
 
@@ -371,7 +405,6 @@ class BoomNonBlockingDCache(hartid: Int)(implicit p: Parameters) extends LazyMod
 
 
 class BoomDCacheBundle(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p) {
-  val hartid = Input(UInt(hartIdLen.W))
   val errors = new DCacheErrors
   val lsu   = Flipped(new LSUDMemIO)
 }
@@ -398,7 +431,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val prober = Module(new BoomProbeUnit)
   val mshrs = Module(new BoomMSHRFile)
   mshrs.io.clear_all    := io.lsu.force_order
-  mshrs.io.brinfo       := io.lsu.brinfo
+  mshrs.io.brupdate       := io.lsu.brupdate
   mshrs.io.exception    := io.lsu.exception
   mshrs.io.rob_pnr_idx  := io.lsu.rob_pnr_idx
   mshrs.io.rob_head_idx := io.lsu.rob_head_idx
@@ -414,7 +447,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   metaReadArb.io.in := DontCare
   for (w <- 0 until memWidth) {
-    meta(w).io.write.valid := metaWriteArb.io.out.fire()
+    meta(w).io.write.valid := metaWriteArb.io.out.fire
     meta(w).io.write.bits  := metaWriteArb.io.out.bits
     meta(w).io.read.valid  := metaReadArb.io.out.valid
     meta(w).io.read.bits   := metaReadArb.io.out.bits.req(w)
@@ -423,7 +456,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   metaWriteArb.io.out.ready := meta.map(_.io.write.ready).reduce(_||_)
 
   // data
-  val data = Module(new BoomDataArray)
+  val data = Module(if (boomParams.numDCacheBanks == 1) new BoomDuplicatedDataArray else new BoomBankedDataArray)
   val dataWriteArb = Module(new Arbiter(new L1DataWriteReq, 2))
   // 0 goes to pipeline, 1 goes to MSHR refills
   val dataReadArb = Module(new Arbiter(new BoomL1DataReadReq, 3))
@@ -436,7 +469,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   }
   dataReadArb.io.out.ready := true.B
 
-  data.io.write.valid := dataWriteArb.io.out.fire()
+  data.io.write.valid := dataWriteArb.io.out.fire
   data.io.write.bits  := dataWriteArb.io.out.bits
   dataWriteArb.io.out.ready := true.B
 
@@ -494,7 +527,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   // -----------
   // Write-backs
-  val wb_fire = wb.io.meta_read.fire() && wb.io.data_req.fire()
+  val wb_fire = wb.io.meta_read.fire && wb.io.data_req.fire
   val wb_req = Wire(Vec(memWidth, new BoomDCacheReq))
   wb_req             := DontCare
   wb_req(0).uop      := NullMicroOp
@@ -511,11 +544,11 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   dataReadArb.io.in(1).bits.req(0)  := wb.io.data_req.bits
   dataReadArb.io.in(1).bits.valid   := widthMap(w => (w == 0).B)
   wb.io.data_req.ready  := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
-  assert(!(wb.io.meta_read.fire() ^ wb.io.data_req.fire()))
+  assert(!(wb.io.meta_read.fire ^ wb.io.data_req.fire))
 
   // -------
   // Prober
-  val prober_fire  = prober.io.meta_read.fire()
+  val prober_fire  = prober.io.meta_read.fire
   val prober_req   = Wire(Vec(memWidth, new BoomDCacheReq))
   prober_req             := DontCare
   prober_req(0).uop      := NullMicroOp
@@ -530,7 +563,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   // -------
   // Prefetcher
-  val prefetch_fire = mshrs.io.prefetch.fire()
+  val prefetch_fire = mshrs.io.prefetch.fire
   val prefetch_req  = Wire(Vec(memWidth, new BoomDCacheReq))
   prefetch_req    := DontCare
   prefetch_req(0) := mshrs.io.prefetch.bits
@@ -542,39 +575,39 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   mshrs.io.prefetch.ready := metaReadArb.io.in(5).ready
   // Prefetch does not need to read data array
 
-  val s0_valid = Mux(io.lsu.req.fire(), VecInit(io.lsu.req.bits.map(_.valid)),
-                 Mux(mshrs.io.replay.fire() || wb_fire || prober_fire || prefetch_fire || mshrs.io.meta_read.fire(),
+  val s0_valid = Mux(io.lsu.req.fire, VecInit(io.lsu.req.bits.map(_.valid)),
+                 Mux(mshrs.io.replay.fire || wb_fire || prober_fire || prefetch_fire || mshrs.io.meta_read.fire,
                                         VecInit(1.U(memWidth.W).asBools), VecInit(0.U(memWidth.W).asBools)))
-  val s0_req   = Mux(io.lsu.req.fire()        , VecInit(io.lsu.req.bits.map(_.bits)),
+  val s0_req   = Mux(io.lsu.req.fire        , VecInit(io.lsu.req.bits.map(_.bits)),
                  Mux(wb_fire                  , wb_req,
                  Mux(prober_fire              , prober_req,
                  Mux(prefetch_fire            , prefetch_req,
-                 Mux(mshrs.io.meta_read.fire(), mshr_read_req
+                 Mux(mshrs.io.meta_read.fire, mshr_read_req
                                               , replay_req)))))
-  val s0_type  = Mux(io.lsu.req.fire()        , t_lsu,
+  val s0_type  = Mux(io.lsu.req.fire        , t_lsu,
                  Mux(wb_fire                  , t_wb,
                  Mux(prober_fire              , t_probe,
                  Mux(prefetch_fire            , t_prefetch,
-                 Mux(mshrs.io.meta_read.fire(), t_mshr_meta_read
+                 Mux(mshrs.io.meta_read.fire, t_mshr_meta_read
                                               , t_replay)))))
 
   // Does this request need to send a response or nack
-  val s0_send_resp_or_nack = Mux(io.lsu.req.fire(), s0_valid,
-    VecInit(Mux(mshrs.io.replay.fire() && isRead(mshrs.io.replay.bits.uop.mem_cmd), 1.U(memWidth.W), 0.U(memWidth.W)).asBools))
+  val s0_send_resp_or_nack = Mux(io.lsu.req.fire, s0_valid,
+    VecInit(Mux(mshrs.io.replay.fire && isRead(mshrs.io.replay.bits.uop.mem_cmd), 1.U(memWidth.W), 0.U(memWidth.W)).asBools))
 
 
   val s1_req          = RegNext(s0_req)
   for (w <- 0 until memWidth)
-    s1_req(w).uop.br_mask := GetNewBrMask(io.lsu.brinfo, s0_req(w).uop)
+    s1_req(w).uop.br_mask := GetNewBrMask(io.lsu.brupdate, s0_req(w).uop)
   val s2_store_failed = Wire(Bool())
   val s1_valid = widthMap(w =>
                  RegNext(s0_valid(w)                                     &&
-                         !IsKilledByBranch(io.lsu.brinfo, s0_req(w).uop) &&
+                         !IsKilledByBranch(io.lsu.brupdate, s0_req(w).uop) &&
                          !(io.lsu.exception && s0_req(w).uop.uses_ldq)   &&
-                         !(s2_store_failed && io.lsu.req.fire() && s0_req(w).uop.uses_stq),
+                         !(s2_store_failed && io.lsu.req.fire && s0_req(w).uop.uses_stq),
                          init=false.B))
   for (w <- 0 until memWidth)
-    assert(!(io.lsu.s1_kill(w) && !RegNext(io.lsu.req.fire()) && !RegNext(io.lsu.req.bits(w).valid)))
+    assert(!(io.lsu.s1_kill(w) && !RegNext(io.lsu.req.fire) && !RegNext(io.lsu.req.bits(w).valid)))
   val s1_addr         = s1_req.map(_.addr)
   val s1_nack         = s1_addr.map(a => a(idxMSB,idxLSB) === prober.io.meta_write.bits.idx && !prober.io.req.ready)
   val s1_send_resp_or_nack = RegNext(s0_send_resp_or_nack)
@@ -600,11 +633,11 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val s2_valid = widthMap(w =>
                   RegNext(s1_valid(w) &&
                          !io.lsu.s1_kill(w) &&
-                         !IsKilledByBranch(io.lsu.brinfo, s1_req(w).uop) &&
+                         !IsKilledByBranch(io.lsu.brupdate, s1_req(w).uop) &&
                          !(io.lsu.exception && s1_req(w).uop.uses_ldq) &&
                          !(s2_store_failed && (s1_type === t_lsu) && s1_req(w).uop.uses_stq)))
   for (w <- 0 until memWidth)
-    s2_req(w).uop.br_mask := GetNewBrMask(io.lsu.brinfo, s1_req(w).uop)
+    s2_req(w).uop.br_mask := GetNewBrMask(io.lsu.brupdate, s1_req(w).uop)
 
   val s2_tag_match_way = RegNext(s1_tag_match_way)
   val s2_tag_match     = s2_tag_match_way.map(_.orR)
@@ -697,7 +730,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   s2_nack           := widthMap(w => (s2_nack_miss(w) || s2_nack_hit(w) || s2_nack_victim(w) || s2_nack_data(w) || s2_nack_wb(w)) && s2_type =/= t_replay)
   val s2_send_resp = widthMap(w => (RegNext(s1_send_resp_or_nack(w)) && !s2_nack(w) &&
-                      (s2_hit(w) || (mshrs.io.req(w).fire() && isWrite(s2_req(w).uop.mem_cmd) && !isRead(s2_req(w).uop.mem_cmd)))))
+                      (s2_hit(w) || (mshrs.io.req(w).fire && isWrite(s2_req(w).uop.mem_cmd) && !isRead(s2_req(w).uop.mem_cmd)))))
   val s2_send_nack = widthMap(w => (RegNext(s1_send_resp_or_nack(w)) && s2_nack(w)))
   for (w <- 0 until memWidth)
     assert(!(s2_send_resp(w) && s2_send_nack(w)))
@@ -716,7 +749,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
                             !s2_nack_data(w)      &&
                             !s2_nack_wb(w)        &&
                              s2_type.isOneOf(t_lsu, t_prefetch)             &&
-                            !IsKilledByBranch(io.lsu.brinfo, s2_req(w).uop) &&
+                            !IsKilledByBranch(io.lsu.brupdate, s2_req(w).uop) &&
                             !(io.lsu.exception && s2_req(w).uop.uses_ldq)   &&
                              (isPrefetch(s2_req(w).uop.mem_cmd) ||
                               isRead(s2_req(w).uop.mem_cmd)     ||
@@ -724,7 +757,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
     assert(!(mshrs.io.req(w).valid && s2_type === t_replay), "Replays should not need to go back into MSHRs")
     mshrs.io.req(w).bits             := DontCare
     mshrs.io.req(w).bits.uop         := s2_req(w).uop
-    mshrs.io.req(w).bits.uop.br_mask := GetNewBrMask(io.lsu.brinfo, s2_req(w).uop)
+    mshrs.io.req(w).bits.uop.br_mask := GetNewBrMask(io.lsu.brupdate, s2_req(w).uop)
     mshrs.io.req(w).bits.addr        := s2_req(w).addr
     mshrs.io.req(w).bits.tag_match   := s2_tag_match(w)
     mshrs.io.req(w).bits.old_meta    := Mux(s2_tag_match(w), L1Metadata(s2_repl_meta(w).tag, s2_hit_state(w)), s2_repl_meta(w))
@@ -737,7 +770,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   mshrs.io.meta_resp.valid      := !s2_nack_hit(0) || prober.io.mshr_wb_rdy
   mshrs.io.meta_resp.bits       := Mux1H(s2_tag_match_way(0), RegNext(meta(0).io.resp))
-  when (mshrs.io.req.map(_.fire()).reduce(_||_)) { replacer.miss }
+  when (mshrs.io.req.map(_.fire).reduce(_||_)) { replacer.miss }
   tl_out.a <> mshrs.io.mem_acquire
 
   // probes and releases
@@ -749,7 +782,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   metaWriteArb.io.in(1) <> prober.io.meta_write
   prober.io.mshr_rdy    := mshrs.io.probe_rdy
   prober.io.wb_rdy      := (prober.io.meta_write.bits.idx =/= wb.io.idx.bits) || !wb.io.idx.valid
-  mshrs.io.prober_idle  := prober.io.req.ready && !lrsc_valid
+  mshrs.io.prober_state := prober.io.state
 
   // refills
   when (tl_out.d.bits.source === cfg.nMSHRs.U) {
@@ -775,19 +808,25 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   wb.io.req            <> wbArb.io.out
   wb.io.data_resp       := s2_data_muxed(0)
   mshrs.io.wb_resp      := wb.io.resp
-  wb.io.mem_grant       := tl_out.d.fire() && tl_out.d.bits.source === cfg.nMSHRs.U
+  wb.io.mem_grant       := tl_out.d.fire && tl_out.d.bits.source === cfg.nMSHRs.U
 
+  val lsu_release_arb = Module(new Arbiter(new TLBundleC(edge.bundle), 2))
+  io.lsu.release <> lsu_release_arb.io.out
+  lsu_release_arb.io.in(0) <> wb.io.lsu_release
+  lsu_release_arb.io.in(1) <> prober.io.lsu_release
 
-  TLArbiter.lowest(edge, io.lsu.release, wb.io.lsu_release, prober.io.lsu_release)
-  io.lsu.release.valid := wb.io.lsu_release.valid || prober.io.lsu_release.valid
   TLArbiter.lowest(edge, tl_out.c, wb.io.release, prober.io.rep)
+
+  io.lsu.perf.release := edge.done(tl_out.c)
+  io.lsu.perf.acquire := edge.done(tl_out.a)
 
   // load data gen
   val s2_data_word_prebypass = widthMap(w => s2_data_muxed(w) >> Cat(s2_word_idx(w), 0.U(log2Ceil(coreDataBits).W)))
   val s2_data_word = Wire(Vec(memWidth, UInt()))
+
   val loadgen = (0 until memWidth).map { w =>
     new LoadGen(s2_req(w).uop.mem_size, s2_req(w).uop.mem_signed, s2_req(w).addr,
-                s2_data_word(w), s2_sc, wordBytes)
+                s2_data_word(w), s2_sc && (w == 0).B, wordBytes)
   }
   // Mux between cache responses and uncache responses
   val cache_resp   = Wire(Vec(memWidth, Valid(new BoomDCacheResp)))
@@ -816,13 +855,13 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   for (w <- 0 until memWidth) {
     io.lsu.resp(w).valid := resp(w).valid &&
                             !(io.lsu.exception && resp(w).bits.uop.uses_ldq) &&
-                            !IsKilledByBranch(io.lsu.brinfo, resp(w).bits.uop)
-    io.lsu.resp(w).bits  := UpdateBrMask(io.lsu.brinfo, resp(w).bits)
+                            !IsKilledByBranch(io.lsu.brupdate, resp(w).bits.uop)
+    io.lsu.resp(w).bits  := UpdateBrMask(io.lsu.brupdate, resp(w).bits)
 
     io.lsu.nack(w).valid := s2_valid(w) && s2_send_nack(w) &&
                             !(io.lsu.exception && s2_req(w).uop.uses_ldq) &&
-                            !IsKilledByBranch(io.lsu.brinfo, s2_req(w).uop)
-    io.lsu.nack(w).bits  := UpdateBrMask(io.lsu.brinfo, s2_req(w))
+                            !IsKilledByBranch(io.lsu.brupdate, s2_req(w).uop)
+    io.lsu.nack(w).bits  := UpdateBrMask(io.lsu.brupdate, s2_req(w))
     assert(!(io.lsu.nack(w).valid && s2_type =/= t_lsu))
   }
 

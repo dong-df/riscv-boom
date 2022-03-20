@@ -119,7 +119,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   def widthMap[T <: Data](f: Int => T) = VecInit((0 until memWidth).map(f))
 
   val pageGranularityPMPs = pmpGranularity >= (1 << pgIdxBits)
-  val sectored_entries = Reg(Vec(cfg.nEntries / cfg.nSectors, new Entry(cfg.nSectors, false, false)))
+  val sectored_entries = Reg(Vec((cfg.nSets * cfg.nWays) / cfg.nSectors, new Entry(cfg.nSectors, false, false)))
   val superpage_entries = Reg(Vec(cfg.nSuperpageEntries, new Entry(1, true, true)))
   val special_entry = (!pageGranularityPMPs).option(Reg(new Entry(1, true, false)))
   def ordinary_entries = sectored_entries ++ superpage_entries
@@ -142,7 +142,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val vpn = widthMap(w => io.req(w).bits.vaddr(vaddrBits-1, pgIdxBits))
   val refill_ppn = io.ptw.resp.bits.pte.ppn(ppnBits-1, 0)
   val do_refill = usingVM.B && io.ptw.resp.valid
-  val invalidate_refill = state.isOneOf(s_request /* don't care */, s_wait_invalidate)
+  val invalidate_refill = state.isOneOf(s_request /* don't care */, s_wait_invalidate) || io.sfence.valid
   val mpu_ppn = widthMap(w =>
                 Mux(do_refill, refill_ppn,
                 Mux(vm_enabled(w) && special_entry.nonEmpty.B, special_entry.map(_.ppn(vpn(w))).getOrElse(0.U), io.req(w).bits.vaddr >> pgIdxBits)))
@@ -174,14 +174,14 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val ppn = widthMap(w => Mux1H(hitsVec(w) :+ !vm_enabled(w), all_entries.map(_.ppn(vpn(w))) :+ vpn(w)(ppnBits-1, 0)))
 
     // permission bit arrays
-  when (do_refill && !invalidate_refill) {
+  when (do_refill) {
     val pte = io.ptw.resp.bits.pte
     val newEntry = Wire(new EntryData)
     newEntry.ppn := pte.ppn
     newEntry.c := cacheable(0)
     newEntry.u := pte.u
     newEntry.g := pte.g
-    newEntry.ae := io.ptw.resp.bits.ae
+    newEntry.ae := io.ptw.resp.bits.ae_final
     newEntry.sr := pte.sr()
     newEntry.sw := pte.sw()
     newEntry.sx := pte.sx()
@@ -311,12 +311,12 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   if (usingVM) {
     val sfence = io.sfence.valid
     for (w <- 0 until memWidth) {
-      when (io.req(w).fire() && tlb_miss(w) && state === s_ready) {
+      when (io.req(w).fire && tlb_miss(w) && state === s_ready) {
         state := s_request
         r_refill_tag := vpn(w)
 
-        r_superpage_repl_addr := replacementEntry(superpage_entries, superpage_plru.replace)
-        r_sectored_repl_addr  := replacementEntry(sectored_entries, sectored_plru.replace)
+        r_superpage_repl_addr := replacementEntry(superpage_entries, superpage_plru.way)
+        r_sectored_repl_addr  := replacementEntry(sectored_entries, sectored_plru.way)
         r_sectored_hit_addr   := OHToUInt(sector_hits(w))
         r_sectored_hit        := sector_hits(w).orR
       }
