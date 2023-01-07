@@ -15,7 +15,6 @@ import chisel3._
 import chisel3.util._
 import chisel3.util.random._
 import chisel3.internal.sourceinfo.{SourceInfo}
-import chisel3.experimental.{chiselName}
 
 import freechips.rocketchip.config.{Parameters}
 import freechips.rocketchip.diplomacy._
@@ -103,7 +102,6 @@ object GetPropertyByHartId
  *
  * @param outer top level ICache class
  */
-@chiselName
 class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   with HasBoomFrontendParameters
 {
@@ -195,7 +193,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       DescribedSRAM(
         name = s"dataArrayWay_${x}",
         desc = "ICache Data Array",
-        size = nSets * refillCycles,
+        size = ramDepth,
         data = UInt((wordBits).W)
       )
     }
@@ -205,14 +203,14 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       DescribedSRAM(
         name = s"dataArrayB0Way_${x}",
         desc = "ICache Data Array",
-        size = nSets * refillCycles,
+        size = ramDepth,
         data = UInt((wordBits/nBanks).W)
       )} ++
     (0 until nWays).map { x =>
       DescribedSRAM(
         name = s"dataArrayB1Way_${x}",
         desc = "ICache Data Array",
-        size = nSets * refillCycles,
+        size = ramDepth,
         data = UInt((wordBits/nBanks).W)
       )}
   }
