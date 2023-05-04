@@ -12,7 +12,7 @@ import freechips.rocketchip.rocket._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.util._
 import freechips.rocketchip.subsystem.{MemoryPortParams}
-import freechips.rocketchip.config.{Parameters, Field}
+import org.chipsalliance.cde.config.{Parameters, Field}
 import freechips.rocketchip.devices.tilelink.{BootROMParams, CLINTParams, PLICParams}
 
 import boom.ifu._
@@ -143,6 +143,9 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(chickenCSRId, mask, Some(init)))
   }
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
+  def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
+
+  override def decls: Seq[CustomCSR] = super.decls :+ marchid
 }
 
 /**
