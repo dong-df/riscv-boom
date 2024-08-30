@@ -134,12 +134,11 @@ case class BoomCoreParams(
   val nPTECacheEntries = 0
   val useHypervisor = false
   val jumpInFrontend: Boolean = false // unused in boom
-  val useBitManip = false
-  val useBitManipCrypto = false
-  val useCryptoNIST = false
-  val useCryptoSM = false
   val traceHasWdata = trace
   val useConditionalZero = false
+  val useZba = true
+  val useZbb = true
+  val useZbs = true
 
   override def customCSRs(implicit p: Parameters) = new BoomCustomCSRs
 }
